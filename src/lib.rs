@@ -17,11 +17,15 @@ use crate::{
 
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const STORAGE_SECTOR_SIZE: usize = 512;
+const MAX_LBA_TRANSFER_SECTORS: usize = 128;
+const MAX_LBA_TRANSFER_BYTES: usize = MAX_LBA_TRANSFER_SECTORS * STORAGE_SECTOR_SIZE;
 
 #[derive(Error, Debug, Clone)]
 pub enum RkUsbError {
     #[error("USB error: {0}")]
     Usb(#[from] rusb::Error),
+    #[error("LBA range overflow")]
+    LbaOverflow,
     #[error("Duplicate bulk endpoint detected in USB interface descriptor")]
     DuplicateBulkEndpoint,
     #[error("CBW/CSW tag mismatch")]
@@ -239,6 +243,19 @@ pub struct RkDevice<T: rusb::UsbContext> {
 }
 
 impl<T: rusb::UsbContext> RkDevice<T> {
+    fn remaining_timeout(deadline: Instant) -> Result<Duration, RkUsbError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or(RkUsbError::Usb(rusb::Error::Timeout))
+    }
+
+    fn advance_lba_by_bytes(pos: u32, bytes: usize) -> Result<u32, RkUsbError> {
+        let sectors =
+            u32::try_from(bytes / STORAGE_SECTOR_SIZE).map_err(|_| RkUsbError::LbaOverflow)?;
+        pos.checked_add(sectors).ok_or(RkUsbError::LbaOverflow)
+    }
+
     fn cbw_transaction(
         &mut self,
         cbw: &usb::Cbw<usb::Cbwcb>,
@@ -247,27 +264,25 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         timeout: Duration,
     ) -> Result<usize, RkUsbError> {
         let deadline = Instant::now() + timeout;
-        let remaining = || {
-            deadline
-                .checked_duration_since(Instant::now())
-                .filter(|x| !x.is_zero())
-                .ok_or(RkUsbError::Usb(rusb::Error::Timeout))
-        };
 
         let opcode = cbw.cb.oper_code;
         let cbw_tag = cbw.tag;
         let cbw_len = cbw.data_transfer_length;
         trace!("Sending CBW opcode={opcode:#04X} tag={cbw_tag:#010X} len={cbw_len}");
-        let n = self
-            .device
-            .write_bulk(self.bulk_out, cbw.as_bytes(), remaining()?)?;
+        let n = self.device.write_bulk(
+            self.bulk_out,
+            cbw.as_bytes(),
+            Self::remaining_timeout(deadline)?,
+        )?;
         if n != std::mem::size_of::<usb::Cbw<usb::Cbwcb>>() {
             return Err(RkUsbError::Usb(rusb::Error::Io));
         }
 
         if let Some(buf) = data_out {
             trace!("Writing data stage bytes={}", buf.len());
-            let n = self.device.write_bulk(self.bulk_out, buf, remaining()?)?;
+            let n =
+                self.device
+                    .write_bulk(self.bulk_out, buf, Self::remaining_timeout(deadline)?)?;
             if n != buf.len() {
                 return Err(RkUsbError::Usb(rusb::Error::Io));
             }
@@ -275,7 +290,9 @@ impl<T: rusb::UsbContext> RkDevice<T> {
 
         let data_in_len = if let Some(buf) = data_in {
             trace!("Reading data stage bytes={}", buf.len());
-            let n = self.device.read_bulk(self.bulk_in, buf, remaining()?)?;
+            let n = self
+                .device
+                .read_bulk(self.bulk_in, buf, Self::remaining_timeout(deadline)?)?;
             let expected_min = cbw.data_transfer_length as usize;
             if n < expected_min || n > buf.len() {
                 return Err(RkUsbError::Usb(rusb::Error::Io));
@@ -286,9 +303,11 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         };
 
         let mut csw_buf = [0u8; std::mem::size_of::<usb::Csw>()];
-        let n = self
-            .device
-            .read_bulk(self.bulk_in, &mut csw_buf, remaining()?)?;
+        let n = self.device.read_bulk(
+            self.bulk_in,
+            &mut csw_buf,
+            Self::remaining_timeout(deadline)?,
+        )?;
         if n != csw_buf.len() {
             return Err(RkUsbError::InvalidCsw);
         }
@@ -373,32 +392,7 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         Ok(())
     }
 
-    /// Download boot entries from a parsed Rockchip boot image.
-    pub fn download_boot(&mut self, boot_img: RkBootImage) -> Result<(), RkUsbError> {
-        for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry471) {
-            info!("Downloading {name} with request 0x0471");
-            self.device_request(0x0471, data)?;
-            sleep(delay);
-        }
-        for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry472) {
-            info!("Downloading {name} with request 0x0472");
-            self.device_request(0x0472, data)?;
-            sleep(delay);
-        }
-        Ok(())
-    }
-
-    /// Reset the connected device with a specific reset subcode.
-    pub fn reset_device(&mut self, subcode: u8) -> Result<(), RkUsbError> {
-        info!("Resetting device with subcode={subcode:#04X}");
-        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0xff); // DEVICE_RESET
-        cbw.cb.reserved = subcode;
-        self.cbw_transaction(&cbw, None, None, USB_TIMEOUT)?;
-        Ok(())
-    }
-
-    /// Write a contiguous sector-aligned buffer to storage starting at the given LBA.
-    pub fn write_lba(
+    fn write_lba_raw(
         &mut self,
         pos: u32,
         data: &[u8],
@@ -430,8 +424,7 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         Ok(())
     }
 
-    /// Read a contiguous range of sectors from storage starting at the given LBA.
-    pub fn read_lba(
+    fn read_lba_raw(
         &mut self,
         pos: u32,
         data: &mut [u8],
@@ -463,8 +456,7 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         Ok(())
     }
 
-    /// Erase a contiguous range of sectors from storage starting at the given LBA.
-    pub fn erase_lba(
+    fn erase_lba_raw(
         &mut self,
         pos: u32,
         sector_count: u16,
@@ -481,6 +473,32 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         cbw.cb.address = pos.to_be();
         cbw.cb.length = sector_count.to_be();
         self.cbw_transaction(&cbw, None, None, timeout)?;
+        Ok(())
+    }
+}
+
+impl<T: rusb::UsbContext> RkDevice<T> {
+    /// Download boot entries from a parsed Rockchip boot image.
+    pub fn download_boot(&mut self, boot_img: RkBootImage) -> Result<(), RkUsbError> {
+        for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry471) {
+            info!("Downloading {name} with request 0x0471");
+            self.device_request(0x0471, data)?;
+            sleep(delay);
+        }
+        for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry472) {
+            info!("Downloading {name} with request 0x0472");
+            self.device_request(0x0472, data)?;
+            sleep(delay);
+        }
+        Ok(())
+    }
+
+    /// Reset the connected device with a specific reset subcode.
+    pub fn reset_device(&mut self, subcode: u8) -> Result<(), RkUsbError> {
+        info!("Resetting device with subcode={subcode:#04X}");
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0xff); // DEVICE_RESET
+        cbw.cb.reserved = subcode;
+        self.cbw_transaction(&cbw, None, None, USB_TIMEOUT)?;
         Ok(())
     }
 
@@ -537,5 +555,125 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     /// Change device storage using a typed storage selector.
     pub fn switch_storage_type(&mut self, storage: RkStorageType) -> Result<(), RkUsbError> {
         self.switch_storage(storage as u8)
+    }
+
+    /// Write bytes to storage starting at the given LBA.
+    ///
+    /// Transfers are batched automatically. If the last chunk is not a whole
+    /// sector, a read-modify-write is used to preserve remaining bytes.
+    pub fn write_lba(
+        &mut self,
+        pos: u32,
+        data: &[u8],
+        subcode: u8,
+        timeout: Duration,
+    ) -> Result<(), RkUsbError> {
+        if data.is_empty() {
+            debug!("Skipping empty LBA write at start_sector={pos}");
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
+        let (aligned, tail) = data.split_at(aligned_len);
+        let mut next_pos = pos;
+
+        for chunk in aligned.chunks(MAX_LBA_TRANSFER_BYTES) {
+            self.write_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
+            next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
+        }
+
+        if !tail.is_empty() {
+            let mut sector = [0u8; STORAGE_SECTOR_SIZE];
+            self.read_lba_raw(
+                next_pos,
+                &mut sector,
+                subcode,
+                Self::remaining_timeout(deadline)?,
+            )?;
+            sector[..tail.len()].copy_from_slice(tail);
+            self.write_lba_raw(
+                next_pos,
+                &sector,
+                subcode,
+                Self::remaining_timeout(deadline)?,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Read bytes from storage starting at the given LBA.
+    ///
+    /// Transfers are batched automatically. If the output length is not a whole
+    /// sector, the trailing bytes are satisfied from one extra 512-byte read.
+    pub fn read_lba(
+        &mut self,
+        pos: u32,
+        data: &mut [u8],
+        subcode: u8,
+        timeout: Duration,
+    ) -> Result<(), RkUsbError> {
+        if data.is_empty() {
+            debug!("Skipping empty LBA read at start_sector={pos}");
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
+        let (aligned, tail) = data.split_at_mut(aligned_len);
+        let mut next_pos = pos;
+
+        for chunk in aligned.chunks_mut(MAX_LBA_TRANSFER_BYTES) {
+            self.read_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
+            next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
+        }
+
+        if !tail.is_empty() {
+            let mut sector = [0u8; STORAGE_SECTOR_SIZE];
+            self.read_lba_raw(
+                next_pos,
+                &mut sector,
+                subcode,
+                Self::remaining_timeout(deadline)?,
+            )?;
+            tail.copy_from_slice(&sector[..tail.len()]);
+        }
+
+        Ok(())
+    }
+
+    /// Erase sectors from storage starting at the given LBA.
+    ///
+    /// The range is split into device-sized commands automatically.
+    pub fn erase_lba(
+        &mut self,
+        pos: u32,
+        sector_count: u32,
+        timeout: Duration,
+    ) -> Result<(), RkUsbError> {
+        if sector_count == 0 {
+            debug!("Skipping empty LBA erase at start_sector={pos}");
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut next_pos = pos;
+        let mut remaining = sector_count;
+
+        while remaining != 0 {
+            let chunk_sectors = remaining.min(u16::MAX as u32);
+            self.erase_lba_raw(
+                next_pos,
+                chunk_sectors as u16,
+                Self::remaining_timeout(deadline)?,
+            )?;
+            next_pos = next_pos
+                .checked_add(chunk_sectors)
+                .ok_or(RkUsbError::LbaOverflow)?;
+            remaining -= chunk_sectors;
+        }
+
+        Ok(())
     }
 }

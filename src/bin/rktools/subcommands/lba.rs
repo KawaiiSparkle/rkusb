@@ -1,7 +1,4 @@
-use std::{
-    fs::{File, OpenOptions},
-    time::{Duration, Instant},
-};
+use std::{fs::OpenOptions, time::Duration};
 
 use clap::Subcommand;
 use memmap2::{Mmap, MmapMut};
@@ -9,11 +6,10 @@ use rkusb::RkDevice;
 
 use crate::{
     common,
-    util::{parse_u8, parse_u32, timeout_to},
+    util::{parse_u8, parse_u32},
 };
 
 const SECTOR_SIZE: usize = 512;
-const DEFAULT_RW_SECTORS: usize = 128;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -79,18 +75,17 @@ pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), Box<dyn std::erro
     let selected_device = common::find_device(&usb_ctx, args.bus, args.addr, args.wait)?;
     let mut rkdev = RkDevice::open(&selected_device)?;
 
-    let deadline = Instant::now() + args.timeout;
     match &args.command {
-        Command::Read(args) => exec_read(&mut rkdev, args, deadline),
-        Command::Write(args) => exec_write(&mut rkdev, args, deadline),
-        Command::Erase(args) => exec_erase(&mut rkdev, args, deadline),
+        Command::Read(sub_args) => exec_read(&mut rkdev, sub_args, args.timeout),
+        Command::Write(sub_args) => exec_write(&mut rkdev, sub_args, args.timeout),
+        Command::Erase(sub_args) => exec_erase(&mut rkdev, sub_args, args.timeout),
     }
 }
 
 fn exec_read<T: rusb::UsbContext>(
     rkdev: &mut RkDevice<T>,
     args: &ReadArgs,
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_bytes = args.sector_count as usize * SECTOR_SIZE;
     let file = OpenOptions::new()
@@ -102,15 +97,7 @@ fn exec_read<T: rusb::UsbContext>(
     file.set_len(output_bytes as u64)?;
     // Safety: file length is fixed before mapping and buffer is only written in-bounds.
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-    let timeout = timeout_to(deadline, rusb::Error::Timeout);
-
-    for (i, chunk) in mmap
-        .chunks_mut(DEFAULT_RW_SECTORS * SECTOR_SIZE)
-        .enumerate()
-    {
-        let pos = args.begin_sector + (i * DEFAULT_RW_SECTORS) as u32;
-        rkdev.read_lba(pos, chunk, args.subcode, timeout()?)?;
-    }
+    rkdev.read_lba(args.begin_sector, &mut mmap, args.subcode, timeout)?;
 
     mmap.flush()?;
 
@@ -121,24 +108,12 @@ fn exec_read<T: rusb::UsbContext>(
 fn exec_write<T: rusb::UsbContext>(
     rkdev: &mut RkDevice<T>,
     args: &WriteArgs,
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(&args.path)?;
+    let file = std::fs::File::open(&args.path)?;
     // Safety: input file is opened read-only and mapping is read-only.
     let mmap = unsafe { Mmap::map(&file)? };
-    let timeout = timeout_to(deadline, rusb::Error::Timeout);
-
-    for (i, chunk) in mmap.chunks(DEFAULT_RW_SECTORS * SECTOR_SIZE).enumerate() {
-        let pos = args.begin_sector + (i * DEFAULT_RW_SECTORS) as u32;
-        let rem = chunk.len() % SECTOR_SIZE;
-        if rem == 0 {
-            rkdev.write_lba(pos, chunk, args.subcode, timeout()?)?;
-        } else {
-            let mut padded = vec![0u8; chunk.len() + SECTOR_SIZE - rem];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            rkdev.write_lba(pos, &padded, args.subcode, timeout()?)?;
-        }
-    }
+    rkdev.write_lba(args.begin_sector, &mmap, args.subcode, timeout)?;
 
     println!("Write LBA OK, wrote {} bytes", mmap.len());
     Ok(())
@@ -147,14 +122,9 @@ fn exec_write<T: rusb::UsbContext>(
 fn exec_erase<T: rusb::UsbContext>(
     rkdev: &mut RkDevice<T>,
     args: &EraseArgs,
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = timeout_to(deadline, rusb::Error::Timeout);
-    for i in (0..args.sector_count).step_by(u16::MAX as usize) {
-        let chunk_sectors = (args.sector_count - i).min(u16::MAX as u32);
-        let pos = args.begin_sector + i;
-        rkdev.erase_lba(pos, chunk_sectors as u16, timeout()?)?;
-    }
+    rkdev.erase_lba(args.begin_sector, args.sector_count, timeout)?;
 
     println!("Erase LBA OK, erased {} sectors", args.sector_count);
     Ok(())

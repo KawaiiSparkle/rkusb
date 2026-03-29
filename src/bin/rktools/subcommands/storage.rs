@@ -11,11 +11,9 @@ use thiserror::Error;
 
 use crate::{
     common,
-    storage::{DEFAULT_IO_TIMEOUT, DEFAULT_LBA_SUBCODE, RkBlockDevice, SECTOR_SIZE},
+    storage::{DEFAULT_IO_TIMEOUT, DEFAULT_LBA_SUBCODE, RkBlockDevice},
     util::parse_u8,
 };
-
-const RW_SECTORS_PER_CHUNK: u64 = 128;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -154,8 +152,8 @@ enum PartitionTransferError {
     LbaOverflow,
     #[error("device transfer failed")]
     DeviceTransfer,
-    #[error("input file size does not match partition size")]
-    InputSizeMismatch,
+    #[error("input file size exceeds partition size")]
+    InputTooLarge,
 }
 
 fn select_partition<'a>(
@@ -221,33 +219,18 @@ fn exec_partition_read<T: rusb::UsbContext>(
             .inspect_err(|e| error!("failed to map output file: {e}"))
             .map_err(PartitionTransferError::MemoryMap)?
     };
-
-    const CHUNK_BYTES: u64 = RW_SECTORS_PER_CHUNK * SECTOR_SIZE;
-
-    for (i, chunk) in output_map.chunks_mut(CHUNK_BYTES as usize).enumerate() {
-        let step = u64::try_from(i)
-            .ok()
-            .and_then(|v| v.checked_mul(RW_SECTORS_PER_CHUNK))
-            .ok_or_else(|| {
-                error!("step overflow while reading partition: chunk_index={i}, sectors_per_chunk={RW_SECTORS_PER_CHUNK}");
-                PartitionTransferError::LbaOverflow
-            })?;
-        let pos = part.first_lba.checked_add(step).ok_or_else(|| {
-            error!(
-                "LBA add overflow while reading partition: first_lba={}, step={step}",
-                part.first_lba
-            );
-            PartitionTransferError::LbaOverflow
-        })?;
-        let pos = u32::try_from(pos)
-            .inspect_err(|e| error!("LBA is out of u32 range while reading partition: {e}"))
-            .map_err(|_| PartitionTransferError::LbaOverflow)?;
-
-        disk.device_mut()
-            .read_lba(pos, chunk, DEFAULT_LBA_SUBCODE, DEFAULT_IO_TIMEOUT)
-            .inspect_err(|e| error!("device read_lba failed: {e}"))
-            .map_err(|_| PartitionTransferError::DeviceTransfer)?;
-    }
+    let pos = u32::try_from(part.first_lba)
+        .inspect_err(|e| error!("partition first_lba is out of u32 range for read: {e}"))
+        .map_err(|_| PartitionTransferError::LbaOverflow)?;
+    disk.device_mut()
+        .read_lba(
+            pos,
+            &mut output_map,
+            DEFAULT_LBA_SUBCODE,
+            DEFAULT_IO_TIMEOUT,
+        )
+        .inspect_err(|e| error!("device read_lba failed: {e}"))
+        .map_err(|_| PartitionTransferError::DeviceTransfer)?;
     output_map
         .flush()
         .inspect_err(|e| error!("failed to flush output map: {e}"))?;
@@ -277,44 +260,20 @@ fn exec_partition_write<T: rusb::UsbContext>(
     let partition_bytes = part
         .bytes_len(Lb512)
         .inspect_err(|e| error!("failed to get partition byte length for write: {e}"))?;
-    if input_len != partition_bytes {
+    if input_len > partition_bytes {
         error!(
-            "input file size mismatch: input_len={} partition='{}' partition_bytes={}",
+            "input file is larger than partition: input_len={} partition='{}' partition_bytes={}",
             input_len, part.name, partition_bytes
         );
-        return Err(PartitionTransferError::InputSizeMismatch);
+        return Err(PartitionTransferError::InputTooLarge);
     }
-
-    const CHUNK_BYTES: u64 = RW_SECTORS_PER_CHUNK * SECTOR_SIZE;
-
-    for (i, chunk) in input_map.chunks(CHUNK_BYTES as usize).enumerate() {
-        let step = u64::try_from(i)
-            .ok()
-            .and_then(|v| v.checked_mul(RW_SECTORS_PER_CHUNK))
-            .ok_or_else(|| {
-                error!("step overflow while writing partition: chunk_index={i}, sectors_per_chunk={RW_SECTORS_PER_CHUNK}");
-                PartitionTransferError::LbaOverflow
-            })?;
-        let pos = part.first_lba.checked_add(step).ok_or_else(|| {
-            error!(
-                "LBA add overflow while writing partition: first_lba={}, step={step}",
-                part.first_lba
-            );
-            PartitionTransferError::LbaOverflow
-        })?;
-        let pos = u32::try_from(pos)
-            .inspect_err(|e| error!("LBA is out of u32 range while writing partition: {e}"))
-            .map_err(|_| PartitionTransferError::LbaOverflow)?;
-
-        debug_assert!(
-            chunk.len().is_multiple_of(SECTOR_SIZE as usize),
-            "input chunk must be sector-aligned"
-        );
-        disk.device_mut()
-            .write_lba(pos, chunk, DEFAULT_LBA_SUBCODE, DEFAULT_IO_TIMEOUT)
-            .inspect_err(|e| error!("device write_lba failed: {e}"))
-            .map_err(|_| PartitionTransferError::DeviceTransfer)?;
-    }
+    let pos = u32::try_from(part.first_lba)
+        .inspect_err(|e| error!("partition first_lba is out of u32 range for write: {e}"))
+        .map_err(|_| PartitionTransferError::LbaOverflow)?;
+    disk.device_mut()
+        .write_lba(pos, &input_map, DEFAULT_LBA_SUBCODE, DEFAULT_IO_TIMEOUT)
+        .inspect_err(|e| error!("device write_lba failed: {e}"))
+        .map_err(|_| PartitionTransferError::DeviceTransfer)?;
 
     println!(
         "Wrote partition '{}' OK, {} bytes <- {}",
