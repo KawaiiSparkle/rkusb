@@ -4,7 +4,7 @@ use std::{
 };
 
 use thiserror::Error;
-use zerocopy::{FromBytes, byteorder::little_endian::*};
+use zerocopy::{FromBytes, Immutable, KnownLayout, byteorder::little_endian::*};
 
 use crate::checksum::ROCKCHIP_CRC32;
 
@@ -17,7 +17,7 @@ pub const RKFW_TAG: u32 = 0x57464B52;
 pub const RKBOOT_TAG: u32 = 0x544F4F42;
 pub const RKLDR_TAG: u32 = 0x2052444C;
 
-#[derive(FromBytes)]
+#[derive(FromBytes, KnownLayout)]
 #[repr(C, packed)]
 pub struct RkTime {
     pub year: U16,
@@ -40,6 +40,7 @@ impl Display for RkTime {
 
 type RkDeviceType = Dword;
 
+#[allow(unused)]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum RkBootEntryType {
@@ -100,10 +101,11 @@ impl Debug for RkBootHeader {
     }
 }
 
+#[derive(FromBytes, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct RkBootEntry {
     pub size: Uchar,
-    pub r#type: RkBootEntryType,
+    pub r#type: Dword, // should be RkBootEntryType
     pub name: [u16; 20],
     pub data_offset: Dword,
     pub data_size: Dword,
@@ -154,9 +156,9 @@ impl Debug for RkFwHeader {
 #[allow(non_snake_case)]
 pub struct RkBootImage<'data> {
     data: &'data [u8],
-    entries_471: Vec<*const RkBootEntry>,
-    entries_472: Vec<*const RkBootEntry>,
-    entries_loader: Vec<*const RkBootEntry>,
+    entries_471: Vec<&'data RkBootEntry>,
+    entries_472: Vec<&'data RkBootEntry>,
+    entries_loader: Vec<&'data RkBootEntry>,
 }
 
 pub struct RkFwImage<'data> {
@@ -182,6 +184,29 @@ pub enum ImageError {
     MD5OutOfRange,
 }
 
+fn parse_entries(
+    data: &[u8],
+    offset: Dword,
+    count: Uchar,
+    size: Uchar,
+) -> Result<Vec<&RkBootEntry>, ImageError> {
+    if (size as usize) < (std::mem::size_of::<RkBootEntry>()) {
+        return Err(ImageError::BootEntryTooShort);
+    }
+    let offset = offset.get() as usize;
+    let end = ((size as usize) * (count as usize))
+        .checked_add(offset)
+        .ok_or(ImageError::BootEntryOutOfRange)?;
+    let entries = data
+        .get(offset..end)
+        .ok_or(ImageError::BootEntryOutOfRange)?
+        .chunks_exact(size as usize)
+        .map(<RkBootEntry as FromBytes>::ref_from_bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ImageError::TooShort)?;
+    Ok(entries)
+}
+
 impl<'data> RkBootImage<'data> {
     pub fn new(data: &'data [u8]) -> Result<Self, ImageError> {
         let header = data
@@ -194,33 +219,20 @@ impl<'data> RkBootImage<'data> {
                 return Err(ImageError::UnknownTag);
             }
 
-            let parse_entries =
-                |offset: Dword, count: Uchar, size: Uchar| -> Result<_, ImageError> {
-                    if (size as usize) < (std::mem::size_of::<RkBootEntry>()) {
-                        return Err(ImageError::BootEntryTooShort);
-                    }
-                    let offset = offset.get() as usize;
-                    let end = ((size as usize) * (count as usize))
-                        .checked_add(offset)
-                        .ok_or(ImageError::BootEntryOutOfRange)?;
-                    Ok(data
-                        .get(offset..end)
-                        .ok_or(ImageError::BootEntryOutOfRange)?
-                        .chunks_exact(size as usize)
-                        .map(|chunk| chunk.as_ptr() as *const RkBootEntry))
-                };
-
             let entries471 = parse_entries(
+                data,
                 (*header).entry_741_offset,
                 (*header).entry_741_count,
                 (*header).entry_741_size,
             )?;
             let entries472 = parse_entries(
+                data,
                 (*header).entry_742_offset,
                 (*header).entry_742_count,
                 (*header).entry_742_size,
             )?;
             let entries_loader = parse_entries(
+                data,
                 (*header).loader_entry_offset,
                 (*header).loader_entry_count,
                 (*header).loader_entry_size,
@@ -228,9 +240,9 @@ impl<'data> RkBootImage<'data> {
 
             Ok(Self {
                 data,
-                entries_471: entries471.collect(),
-                entries_472: entries472.collect(),
-                entries_loader: entries_loader.collect(),
+                entries_471: entries471,
+                entries_472: entries472,
+                entries_loader: entries_loader,
             })
         }
     }
@@ -347,19 +359,17 @@ impl Debug for RkBootImage<'_> {
             .into_iter()
             .flatten()
         {
-            unsafe {
-                let RkBootEntry {
-                    size,
-                    r#type,
-                    name,
-                    data_offset,
-                    data_size,
-                    data_delay,
-                } = **entry_header;
-                let name = String::from_utf16_lossy(&name[..]);
-                let name = name.trim_end_matches('\0').to_owned();
-                ds.field(&name, &format_args!("{type:?} {{ size: {size:#X}, data_offset: {data_offset:#X}, data_size: {data_size:#X}, data_delay: {data_delay} }}"));
-            }
+            let RkBootEntry {
+                size,
+                r#type,
+                name,
+                data_offset,
+                data_size,
+                data_delay,
+            } = **entry_header;
+            let name = String::from_utf16_lossy(&name[..]);
+            let name = name.trim_end_matches('\0').to_owned();
+            ds.field(&name, &format_args!("{type:?} {{ size: {size:#X}, data_offset: {data_offset:#X}, data_size: {data_size:#X}, data_delay: {data_delay} }}"));
         }
 
         ds.finish()

@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
-use super::{IDBLOCK_ALIGNMENT, IdBlockError, RC4_KEY, Rc4Cipher, SECTOR_SIZE};
-use rc4::{KeyInit, StreamCipher};
+use super::{IDBLOCK_ALIGNMENT, IdBlockError, RC4_KEY, SECTOR_SIZE};
+use rc4::{KeyInit, Rc4, StreamCipher};
 use thiserror::Error;
 use zerocopy::{
     FromBytes,
@@ -124,7 +124,9 @@ pub fn build_idblock(
     if rc4_enabled {
         for sectors in [head_area, ddr_area, loader_area] {
             for chunk in sectors.chunks_exact_mut(SECTOR_SIZE) {
-                Rc4Cipher::new((&RC4_KEY).into()).apply_keystream(chunk);
+                Rc4::new_from_slice(&RC4_KEY)
+                    .unwrap()
+                    .apply_keystream(chunk);
             }
         }
     }

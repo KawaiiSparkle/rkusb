@@ -5,10 +5,10 @@ use std::{
 };
 
 use memmap2::Mmap;
-use rc4::{KeyInit, StreamCipher};
+use rc4::{KeyInit, Rc4, StreamCipher};
 use rkusb::{
     idblock::{
-        RC4_KEY, Rc4Cipher,
+        RC4_KEY,
         new::{RKNS_TAG, RkNsImage},
     },
     image::{RKBOOT_TAG, RKFW_TAG, RKLDR_TAG, RkBootEntryType, RkBootImage, RkFwImage},
@@ -65,7 +65,9 @@ fn dump_flash_head_idblock(boot_img: &RkBootImage<'_>) {
 
     let mut flash_head = Cow::Borrowed(flash_head);
     if unsafe { (*boot_img.boot_header_ptr()).rc4_flag } != 0 {
-        Rc4Cipher::new((&RC4_KEY).into()).apply_keystream(flash_head.to_mut());
+        Rc4::new_from_slice(&RC4_KEY)
+            .unwrap()
+            .apply_keystream(flash_head.to_mut());
     }
 
     println!("FlashHead IDBlock: {:#X?}", RkNsImage::new(&flash_head));

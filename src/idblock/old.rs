@@ -1,6 +1,6 @@
-use super::{IDBLOCK_ALIGNMENT, IdBlockError, RC4_KEY, Rc4Cipher, SECTOR_SIZE};
+use super::{IDBLOCK_ALIGNMENT, IdBlockError, RC4_KEY, SECTOR_SIZE};
 use crate::checksum::{ROCKCHIP_CRC16, ROCKCHIP_CRC32};
-use rc4::{KeyInit, StreamCipher};
+use rc4::{KeyInit, Rc4, StreamCipher};
 
 const IDBLOCK_HEADER_SECTORS: usize = 4;
 pub const IDBLOCK_TAG: u32 = 0x0FF0AA55;
@@ -63,7 +63,9 @@ pub fn build_idblock(
     if rc4_enabled {
         for sectors in [ddr_area, loader_area] {
             for chunk in sectors.chunks_exact_mut(SECTOR_SIZE) {
-                Rc4Cipher::new((&RC4_KEY).into()).apply_keystream(chunk);
+                Rc4::new_from_slice(&RC4_KEY)
+                    .unwrap()
+                    .apply_keystream(chunk);
             }
         }
     }
@@ -77,7 +79,9 @@ pub fn build_idblock(
     if rc4_enabled {
         for sectors in [sector_0, sector_2, sector_3] {
             for chunk in sectors.chunks_exact_mut(SECTOR_SIZE) {
-                Rc4Cipher::new((&RC4_KEY).into()).apply_keystream(chunk);
+                Rc4::new_from_slice(&RC4_KEY)
+                    .unwrap()
+                    .apply_keystream(chunk);
             }
         }
     }
