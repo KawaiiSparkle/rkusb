@@ -1,6 +1,8 @@
 use super::{IDBLOCK_ALIGNMENT, IdBlockError, RC4_KEY, SECTOR_SIZE};
-use crate::checksum::{ROCKCHIP_CRC16, ROCKCHIP_CRC32};
+use crate::checksum::ROCKCHIP_CRC16;
+
 use rc4::{KeyInit, Rc4, StreamCipher};
+use rkafp::rkaf::RK_CRC;
 
 const IDBLOCK_HEADER_SECTORS: usize = 4;
 pub const IDBLOCK_TAG: u32 = 0x0FF0AA55;
@@ -73,7 +75,7 @@ pub fn build_idblock(
     let sec0_crc = ROCKCHIP_CRC16.checksum(sector_0);
     let sec1_crc = ROCKCHIP_CRC16.checksum(sector_1);
     let sec3_crc = ROCKCHIP_CRC16.checksum(sector_3);
-    let boot_code_crc = ROCKCHIP_CRC32.checksum(payload);
+    let boot_code_crc = RK_CRC.checksum(payload);
     build_sector_2(sector_2, sec0_crc, sec1_crc, boot_code_crc, sec3_crc);
 
     if rc4_enabled {

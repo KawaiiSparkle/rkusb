@@ -1,42 +1,21 @@
 use std::{
-    fmt::{Debug, Display, Formatter},
+    fmt::{Debug, Formatter},
     time::Duration,
 };
 
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, KnownLayout, byteorder::little_endian::*};
 
-use crate::checksum::ROCKCHIP_CRC32;
+use rkafp::rkaf::RK_CRC;
+pub use rkafp::rkfw::{ImageHeader as RkFwHeader, MAGIC as RKFW_TAG, RkTime};
 
 type Uchar = u8;
 type Ushort = U16;
 type Uint = U32;
 type Dword = U32;
 
-pub const RKFW_TAG: u32 = 0x57464B52;
-pub const RKBOOT_TAG: u32 = 0x544F4F42;
-pub const RKLDR_TAG: u32 = 0x2052444C;
-
-#[derive(FromBytes, KnownLayout)]
-#[repr(C, packed)]
-pub struct RkTime {
-    pub year: U16,
-    pub month: u8,
-    pub day: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
-}
-
-impl Display for RkTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
-        )
-    }
-}
+pub const RKBOOT_TAG: u32 = U32::from_bytes(*b"BOOT").get();
+pub const RKLDR_TAG: u32 = U32::from_bytes(*b"LDR ").get();
 
 type RkDeviceType = Dword;
 
@@ -110,47 +89,6 @@ pub struct RkBootEntry {
     pub data_offset: Dword,
     pub data_size: Dword,
     pub data_delay: Dword,
-}
-
-#[derive(FromBytes)]
-#[repr(C, packed)]
-pub struct RkFwHeader {
-    pub tag: Uint,
-    pub size: Ushort,
-    pub version: Dword,
-    pub merge_version: Dword,
-    pub release_time: RkTime,
-    pub support_chip: RkDeviceType,
-    pub boot_offset: Dword,
-    pub boot_size: Dword,
-    pub fw_offset: Dword,
-    pub fw_size: Dword,
-    pub reserved_0: [u8; 4],
-    pub os_type: Dword,
-    pub reserved_1: [u8; 4],
-    pub backup_size: Ushort,
-    pub reserved_2: [u8; 2],
-    pub fw_offset_hi: Dword,
-    pub reserved_3: [u8; 41],
-}
-
-impl Debug for RkFwHeader {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RkFwHeader")
-            .field("tag", &self.tag.get())
-            .field("size", &self.size.get())
-            .field("version", &self.version.get())
-            .field("merge_version", &self.merge_version.get())
-            .field("release_time", &self.release_time.to_string())
-            .field("support_chip", &self.support_chip.get())
-            .field("boot_offset", &self.boot_offset.get())
-            .field("boot_size", &self.boot_size.get())
-            .field("fw_offset", &self.fw_offset.get())
-            .field("fw_size", &self.fw_size.get())
-            .field("os_type", &self.os_type.get())
-            .field("backup_size", &self.backup_size.get())
-            .finish()
-    }
 }
 
 #[allow(non_snake_case)]
@@ -262,7 +200,7 @@ impl<'data> RkBootImage<'data> {
     }
 
     pub fn calculate_crc32(&self) -> u32 {
-        ROCKCHIP_CRC32.checksum(self.data.split_last_chunk::<4>().unwrap().0)
+        RK_CRC.checksum(self.data.split_last_chunk::<4>().unwrap().0)
     }
 
     pub fn iter_entries(
@@ -381,11 +319,6 @@ impl Debug for RkFwImage<'_> {
         let header = unsafe { std::ptr::read_unaligned(self.header_ptr()) };
         f.debug_struct("RkFwImage")
             .field("header", &header)
-            .field("os_type", &format_args!("{:#X}", header.os_type.get()))
-            .field(
-                "backup_size",
-                &format_args!("{:#X}", header.backup_size.get()),
-            )
             .field("fw_len", &self.fw.len())
             .field("md5", &String::from_utf8_lossy(self.md5))
             .field("sign_len", &self.sign.map(hex::encode))
