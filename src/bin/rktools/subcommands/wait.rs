@@ -17,7 +17,12 @@ pub struct Args {
 }
 
 pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let device = common::find_device(&usb_ctx, args.bus, args.addr, args.timeout)?;
+    let device = common::find_device(
+        &usb_ctx,
+        args.bus,
+        args.addr,
+        args.timeout.or(Some(Duration::MAX)),
+    )?;
     println!(
         "Device found: Bus {:03} Device {:03}",
         device.bus_number(),
