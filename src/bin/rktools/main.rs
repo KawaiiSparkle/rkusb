@@ -44,11 +44,16 @@ enum Commands {
     UpgradeLoader(subcommands::upgrade_loader::Args),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let cli = Cli::parse();
     init_logger(cli.verbose);
+    if let Err(err) = handle_command(&cli.command) {
+        eprintln!("{err}");
+    }
+}
 
-    match &cli.command {
+fn handle_command(cmd: &Commands) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
         Commands::List(args) => subcommands::list::exec(rusb::Context::new()?, args)?,
         Commands::DownloadBoot(args) => {
             subcommands::download_boot::exec(rusb::Context::new()?, args)?
