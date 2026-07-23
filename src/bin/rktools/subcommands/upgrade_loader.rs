@@ -96,8 +96,9 @@ pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), UpgradeLoaderErro
         }
     }
 
+    let lba_size = rkdev.read_storage_info()?.lba_size() as usize;
     let idblock_data = idblock::build_idblock(loader_head, loader_data, loader_code, rc4_enabled)?;
-    rkdev.write_lba(args.lba, &idblock_data, args.subcode, timeout()?)?;
+    rkdev.write_lba(args.lba, &idblock_data, lba_size, args.subcode, timeout()?)?;
     println!(
         "Upgrade loader OK, wrote {} sectors to LBA {}",
         idblock_data.len() / SECTOR_SIZE,

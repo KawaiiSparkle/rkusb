@@ -15,6 +15,7 @@ pub(crate) struct RkBlockDevice<'a, T: rusb::UsbContext> {
     rkdev: &'a mut RkDevice<T>,
     pos: u64,
     disk_size_bytes: u64,
+    lba_size_sectors: usize,
     subcode: u8,
     timeout: Duration,
 }
@@ -23,6 +24,7 @@ impl<'a, T: rusb::UsbContext> RkBlockDevice<'a, T> {
     pub(crate) fn new(
         rkdev: &'a mut RkDevice<T>,
         disk_size_bytes: u64,
+        lba_size_sectors: usize,
         subcode: u8,
         timeout: Duration,
     ) -> Self {
@@ -30,6 +32,7 @@ impl<'a, T: rusb::UsbContext> RkBlockDevice<'a, T> {
             rkdev,
             pos: 0,
             disk_size_bytes,
+            lba_size_sectors,
             subcode,
             timeout,
         }
@@ -41,13 +44,15 @@ impl<'a, T: rusb::UsbContext> TryFrom<&'a mut RkDevice<T>> for RkBlockDevice<'a,
 
     fn try_from(rkdev: &'a mut RkDevice<T>) -> Result<Self, Self::Error> {
         let info = rkdev.read_storage_info().map_err(io::Error::other)?;
-        let disk_size_bytes = (info.flash_size as u64)
+        let disk_size_bytes = (info.flash_size.get() as u64)
             .checked_mul(SECTOR_SIZE)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "disk size overflow"))?;
+        let lba_size_sectors = info.lba_size() as usize;
 
         Ok(Self::new(
             rkdev,
             disk_size_bytes,
+            lba_size_sectors,
             DEFAULT_LBA_SUBCODE,
             DEFAULT_IO_TIMEOUT,
         ))
@@ -90,40 +95,51 @@ impl<T: rusb::UsbContext> Read for RkBlockDevice<'_, T> {
             .pos
             .checked_add(read_len as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read position overflow"))?;
-        let sector_size = SECTOR_SIZE as usize;
+        let lba_size_bytes = self.lba_size_sectors * SECTOR_SIZE as usize;
         let mut pos = self.pos;
         let mut remaining = buf;
+        let mut tmp = vec![0u8; lba_size_bytes];
 
-        // 1) Handle first unaligned sector.
-        let offset_in_sector = (pos % SECTOR_SIZE) as usize;
-        if offset_in_sector != 0 {
-            let start_sector = pos / SECTOR_SIZE;
-            let lba = u32::try_from(start_sector)
+        // 1) Handle first unaligned LBA.
+        let offset_in_lba = (pos % self.lba_size_sectors as u64) as usize;
+        if offset_in_lba != 0 {
+            let start_lba = pos / self.lba_size_sectors as u64;
+            let lba = u32::try_from(start_lba)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
 
-            let mut tmp = [0u8; SECTOR_SIZE as usize];
             self.rkdev
-                .read_lba(lba, &mut tmp, self.subcode, self.timeout)
+                .read_lba(
+                    lba,
+                    &mut tmp,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
 
-            let readable = (sector_size - offset_in_sector).min(remaining.len());
-            remaining[..readable]
-                .copy_from_slice(&tmp[offset_in_sector..offset_in_sector + readable]);
+            let readable = (self.lba_size_sectors - offset_in_lba).min(remaining.len());
+            remaining[..readable].copy_from_slice(&tmp[offset_in_lba..offset_in_lba + readable]);
             pos = pos.checked_add(readable as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "read position overflow")
             })?;
             remaining = &mut remaining[readable..];
         }
 
-        // 2) Handle middle full sectors directly.
-        let aligned_len = (remaining.len() / sector_size) * sector_size;
+        // 2) Handle middle full LBAs directly.
+        let aligned_len = (remaining.len() / self.lba_size_sectors) * self.lba_size_sectors;
         if aligned_len != 0 {
-            let start_sector = pos / SECTOR_SIZE;
+            let start_sector = pos / self.lba_size_sectors as u64;
             let lba = u32::try_from(start_sector)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
             let (aligned, tail) = remaining.split_at_mut(aligned_len);
             self.rkdev
-                .read_lba(lba, aligned, self.subcode, self.timeout)
+                .read_lba(
+                    lba,
+                    aligned,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
             pos = pos.checked_add(aligned_len as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "read position overflow")
@@ -131,15 +147,20 @@ impl<T: rusb::UsbContext> Read for RkBlockDevice<'_, T> {
             remaining = tail;
         }
 
-        // 3) Handle last partial sector.
+        // 3) Handle last partial LBA.
         if !remaining.is_empty() {
-            let start_sector = pos / SECTOR_SIZE;
-            let lba = u32::try_from(start_sector)
+            let start_lba = pos / self.lba_size_sectors as u64;
+            let lba = u32::try_from(start_lba)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
 
-            let mut tmp = [0u8; SECTOR_SIZE as usize];
             self.rkdev
-                .read_lba(lba, &mut tmp, self.subcode, self.timeout)
+                .read_lba(
+                    lba,
+                    &mut tmp,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
             remaining.copy_from_slice(&tmp[..remaining.len()]);
         }
@@ -157,28 +178,34 @@ impl<T: rusb::UsbContext> Write for RkBlockDevice<'_, T> {
         let end_pos = self.pos.checked_add(buf.len() as u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "write position overflow")
         })?;
-        let sector_size = SECTOR_SIZE as usize;
+        let lba_size_bytes = self.lba_size_sectors * SECTOR_SIZE as usize;
         let mut pos = self.pos;
         let mut remaining = buf;
+        let mut tmp = vec![0u8; lba_size_bytes];
 
-        // 1) Handle first unaligned sector with read-modify-write.
-        let offset_in_sector = (pos % SECTOR_SIZE) as usize;
+        // 1) Handle first unaligned LBA with read-modify-write.
+        let offset_in_sector = (pos % self.lba_size_sectors as u64) as usize;
         if offset_in_sector != 0 {
             let start_sector = pos / SECTOR_SIZE;
             let lba = u32::try_from(start_sector)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
 
-            let mut tmp = [0u8; SECTOR_SIZE as usize];
             self.rkdev
-                .read_lba(lba, &mut tmp, self.subcode, self.timeout)
+                .read_lba(
+                    lba,
+                    &mut tmp,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
 
-            let writable = (sector_size - offset_in_sector).min(remaining.len());
+            let writable = (self.lba_size_sectors - offset_in_sector).min(remaining.len());
             tmp[offset_in_sector..offset_in_sector + writable]
                 .copy_from_slice(&remaining[..writable]);
 
             self.rkdev
-                .write_lba(lba, &tmp, self.subcode, self.timeout)
+                .write_lba(lba, &tmp, self.lba_size_sectors, self.subcode, self.timeout)
                 .map_err(io::Error::other)?;
             pos = pos.checked_add(writable as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "write position overflow")
@@ -186,15 +213,21 @@ impl<T: rusb::UsbContext> Write for RkBlockDevice<'_, T> {
             remaining = &remaining[writable..];
         }
 
-        // 2) Handle middle full sectors directly.
-        let aligned_len = (remaining.len() / sector_size) * sector_size;
+        // 2) Handle middle full LBAs directly.
+        let aligned_len = (remaining.len() / self.lba_size_sectors) * self.lba_size_sectors;
         if aligned_len != 0 {
-            let start_sector = pos / SECTOR_SIZE;
-            let lba = u32::try_from(start_sector)
+            let start_lba = pos / self.lba_size_sectors as u64;
+            let lba = u32::try_from(start_lba)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
             let (aligned, tail) = remaining.split_at(aligned_len);
             self.rkdev
-                .write_lba(lba, aligned, self.subcode, self.timeout)
+                .write_lba(
+                    lba,
+                    aligned,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
             pos = pos.checked_add(aligned_len as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "write position overflow")
@@ -204,18 +237,23 @@ impl<T: rusb::UsbContext> Write for RkBlockDevice<'_, T> {
 
         // 3) Handle last partial sector with read-modify-write.
         if !remaining.is_empty() {
-            let start_sector = pos / SECTOR_SIZE;
+            let start_sector = pos / self.lba_size_sectors as u64;
             let lba = u32::try_from(start_sector)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LBA out of range"))?;
 
-            let mut tmp = [0u8; SECTOR_SIZE as usize];
             self.rkdev
-                .read_lba(lba, &mut tmp, self.subcode, self.timeout)
+                .read_lba(
+                    lba,
+                    &mut tmp,
+                    self.lba_size_sectors,
+                    self.subcode,
+                    self.timeout,
+                )
                 .map_err(io::Error::other)?;
             tmp[..remaining.len()].copy_from_slice(remaining);
 
             self.rkdev
-                .write_lba(lba, &tmp, self.subcode, self.timeout)
+                .write_lba(lba, &tmp, self.lba_size_sectors, self.subcode, self.timeout)
                 .map_err(io::Error::other)?;
         }
 
