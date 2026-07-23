@@ -1,6 +1,6 @@
 [package]
 name = "rkusb"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Tnze <Tnze@tnze.tech>"]
 license = "GPL-2.0"
