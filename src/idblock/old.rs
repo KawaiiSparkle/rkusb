@@ -64,7 +64,7 @@ pub fn build_idblock(
 
     if rc4_enabled {
         for sectors in [ddr_area, loader_area] {
-            for chunk in sectors.chunks_exact_mut(SECTOR_SIZE) {
+            for chunk in sectors.as_chunks_mut::<SECTOR_SIZE>().0 {
                 Rc4::new_from_slice(&RC4_KEY)
                     .unwrap()
                     .apply_keystream(chunk);
@@ -80,7 +80,7 @@ pub fn build_idblock(
 
     if rc4_enabled {
         for sectors in [sector_0, sector_2, sector_3] {
-            for chunk in sectors.chunks_exact_mut(SECTOR_SIZE) {
+            for chunk in sectors.as_chunks_mut::<SECTOR_SIZE>().0 {
                 Rc4::new_from_slice(&RC4_KEY)
                     .unwrap()
                     .apply_keystream(chunk);

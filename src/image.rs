@@ -180,7 +180,7 @@ impl<'data> RkBootImage<'data> {
                 data,
                 entries_471: entries471,
                 entries_472: entries472,
-                entries_loader: entries_loader,
+                entries_loader,
             })
         }
     }
@@ -243,7 +243,7 @@ impl<'data> RkFwImage<'data> {
         let (fw_offset, fw_end) = unsafe {
             let fw_size = (*header).fw_size.get() as usize;
             let mut fw_offset = (*header).fw_offset.get() as usize;
-            if (*header).reserved_2 == [b'H', b'I'] {
+            if &(*header).reserved_2 == b"HI" {
                 fw_offset |= ((*header).fw_offset_hi.get() as usize) << 32;
             }
             let fw_end = fw_offset
