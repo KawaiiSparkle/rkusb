@@ -43,12 +43,10 @@ enum Command {
 
 #[derive(clap::Args)]
 struct ReadArgs {
-    #[arg(help = "Begin LBA (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
-    begin: u32,
-    #[arg(help = "LBA count (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
-    count: u32,
-    #[arg(short = 'b', help = "Sectors per LBA. Auto-detected by default")]
-    lba_size: Option<usize>,
+    #[arg(help = "Begin sector (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
+    begin_sector: u32,
+    #[arg(help = "Sector count (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
+    sector_count: u32,
     #[arg(help = "Output file path")]
     path: String,
     #[arg(short, long, default_value_t = 0, value_parser = parse_u8, help = "Read subcode")]
@@ -57,10 +55,8 @@ struct ReadArgs {
 
 #[derive(clap::Args)]
 struct WriteArgs {
-    #[arg(help = "Begin LBA (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
-    begin: u32,
-    #[arg(short = 'b', help = "LBA Size in sectors. Auto-detected by default")]
-    lba_size: Option<usize>,
+    #[arg(help = "Begin sector (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
+    begin_sector: u32,
     #[arg(help = "Input file path")]
     path: String,
     #[arg(short, long, default_value_t = 0, value_parser = parse_u8, help = "Write subcode")]
@@ -69,10 +65,10 @@ struct WriteArgs {
 
 #[derive(clap::Args)]
 struct EraseArgs {
-    #[arg(help = "Begin LBA (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
-    begin: u32,
-    #[arg(help = "LBA count (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
-    count: u32,
+    #[arg(help = "Begin sector (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
+    begin_sector: u32,
+    #[arg(help = "Sector count (supports decimal or 0x-prefixed hex)", value_parser = parse_u32)]
+    sector_count: u32,
 }
 
 pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +87,7 @@ fn exec_read<T: rusb::UsbContext>(
     args: &ReadArgs,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output_bytes = args.count as usize * SECTOR_SIZE;
+    let output_bytes = args.sector_count as usize * SECTOR_SIZE;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -101,15 +97,11 @@ fn exec_read<T: rusb::UsbContext>(
     file.set_len(output_bytes as u64)?;
     // Safety: file length is fixed before mapping and buffer is only written in-bounds.
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-    let lba_size = match args.lba_size {
-        Some(x) => x,
-        None => rkdev.read_storage_info()?.lba_size() as usize,
-    };
-    rkdev.read_lba(args.begin, &mut mmap, lba_size, args.subcode, timeout)?;
+    rkdev.read_lba(args.begin_sector, &mut mmap, args.subcode, timeout)?;
 
     mmap.flush()?;
 
-    println!("Read LBA OK, read {} sectors", args.count);
+    println!("Read LBA OK, read {} sectors", args.sector_count);
     Ok(())
 }
 
@@ -121,11 +113,7 @@ fn exec_write<T: rusb::UsbContext>(
     let file = std::fs::File::open(&args.path)?;
     // Safety: input file is opened read-only and mapping is read-only.
     let mmap = unsafe { Mmap::map(&file)? };
-    let lba_size = match args.lba_size {
-        Some(x) => x,
-        None => rkdev.read_storage_info()?.lba_size() as usize,
-    };
-    rkdev.write_lba(args.begin, &mmap, lba_size, args.subcode, timeout)?;
+    rkdev.write_lba(args.begin_sector, &mmap, args.subcode, timeout)?;
 
     println!("Write LBA OK, wrote {} bytes", mmap.len());
     Ok(())
@@ -136,8 +124,8 @@ fn exec_erase<T: rusb::UsbContext>(
     args: &EraseArgs,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    rkdev.erase_lba(args.begin, args.count, timeout)?;
+    rkdev.erase_lba(args.begin_sector, args.sector_count, timeout)?;
 
-    println!("Erase LBA OK, erased {} LBA(s)", args.count);
+    println!("Erase LBA OK, erased {} sectors", args.sector_count);
     Ok(())
 }

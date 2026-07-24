@@ -6,7 +6,7 @@ use std::{
 
 use crc::{CRC_16_IBM_3740, Crc};
 use humansize::SizeFormatter;
-use log::{debug, error, info, trace};
+use log::{debug, info, trace};
 use thiserror::Error;
 use zerocopy::{
     FromBytes, TryFromBytes,
@@ -19,9 +19,9 @@ use crate::{
 };
 
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
-const STORAGE_SECTOR_SIZE: u64 = 512;
-const MAX_LBA_TRANSFER_SECTORS: u64 = 128;
-const MAX_LBA_TRANSFER_BYTES: u64 = MAX_LBA_TRANSFER_SECTORS * STORAGE_SECTOR_SIZE;
+const STORAGE_SECTOR_SIZE: usize = 512;
+const MAX_LBA_TRANSFER_SECTORS: usize = 128;
+const MAX_LBA_TRANSFER_BYTES: usize = MAX_LBA_TRANSFER_SECTORS * STORAGE_SECTOR_SIZE;
 
 #[derive(Error, Debug, Clone)]
 pub enum RkUsbError {
@@ -62,19 +62,19 @@ pub struct RkFlashInfo {
 
 impl std::fmt::Debug for RkFlashInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let flash_size_sectors = self.flash_size.get();
-        let block_size_sectors = self.block_size.get();
-        let page_size_sectors = self.page_size;
+        let flash_size_sectors = self.flash_size.get() as u64;
+        let block_size_sectors = self.block_size.get() as u64;
+        let page_size_sectors = self.page_size as u64;
         let flash_size = SizeFormatter::new(
-            STORAGE_SECTOR_SIZE.saturating_mul(flash_size_sectors as u64),
+            flash_size_sectors.saturating_mul(STORAGE_SECTOR_SIZE as u64),
             humansize::BINARY,
         );
         let block_size = SizeFormatter::new(
-            STORAGE_SECTOR_SIZE.saturating_mul(block_size_sectors as u64),
+            block_size_sectors.saturating_mul(STORAGE_SECTOR_SIZE as u64),
             humansize::BINARY,
         );
         let page_size = SizeFormatter::new(
-            (page_size_sectors as u64).saturating_mul(STORAGE_SECTOR_SIZE),
+            page_size_sectors.saturating_mul(STORAGE_SECTOR_SIZE as u64),
             humansize::BINARY,
         );
         let ecc_bits = self.ecc_bits;
@@ -89,9 +89,9 @@ impl std::fmt::Debug for RkFlashInfo {
                 &format_args!("{}, value={manuf_code:02X}", flash_manuf_name(manuf_code)),
             );
         } else {
-            let lba_size_sectors = self.manufacture - 200;
+            let lba_size_sectors = (self.manufacture - 200) as u64;
             let lba_size = SizeFormatter::new(
-                (page_size_sectors as u64).saturating_mul(STORAGE_SECTOR_SIZE),
+                lba_size_sectors.saturating_mul(STORAGE_SECTOR_SIZE as u64),
                 humansize::BINARY,
             );
             s.field(
@@ -288,8 +288,8 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     }
 
     fn advance_lba_by_bytes(pos: u32, bytes: usize) -> Result<u32, RkUsbError> {
-        let sectors = u32::try_from(bytes / STORAGE_SECTOR_SIZE as usize)
-            .map_err(|_| RkUsbError::LbaOverflow)?;
+        let sectors =
+            u32::try_from(bytes / STORAGE_SECTOR_SIZE).map_err(|_| RkUsbError::LbaOverflow)?;
         pos.checked_add(sectors).ok_or(RkUsbError::LbaOverflow)
     }
 
@@ -432,26 +432,29 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     fn write_lba_raw(
         &mut self,
         pos: u32,
-        count: u16,
         data: &[u8],
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
-        if data.is_empty() || count == 0 {
+        if data.is_empty() {
             debug!("Skipping empty LBA write at start_sector={pos}");
             return Ok(());
         }
 
-        if !data.len().is_multiple_of(STORAGE_SECTOR_SIZE as usize) {
+        if !data.len().is_multiple_of(STORAGE_SECTOR_SIZE) {
             return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
         }
 
-        trace!("WRITE_LBA lba={pos:#010X} count={count:#06X} subcode={subcode:#04X}");
+        let sector_count = data.len() / STORAGE_SECTOR_SIZE;
+        let sector_count_u16 =
+            u16::try_from(sector_count).map_err(|_| RkUsbError::Usb(rusb::Error::InvalidParam))?;
+
+        trace!("WRITE_LBA lba={pos:#010X} count={sector_count_u16:#06X} subcode={subcode:#04X}");
 
         let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x15); // WRITE_LBA
         cbw.data_transfer_length = data.len() as u32;
         cbw.cb.address = pos.to_be();
-        cbw.cb.length = count.to_be();
+        cbw.cb.length = sector_count_u16.to_be();
         cbw.cb.reserved = subcode;
         self.cbw_transaction(&cbw, Some(data), None, timeout)?;
 
@@ -461,43 +464,51 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     fn read_lba_raw(
         &mut self,
         pos: u32,
-        count: u16,
         data: &mut [u8],
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
-        if data.is_empty() || count == 0 {
+        if data.is_empty() {
             debug!("Skipping empty LBA read at start_sector={pos}");
             return Ok(());
         }
 
-        if !data.len().is_multiple_of(STORAGE_SECTOR_SIZE as usize) {
+        if !data.len().is_multiple_of(STORAGE_SECTOR_SIZE) {
             return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
         }
 
-        trace!("READ_LBA pos={pos:#010X} count={count:#06X} subcode={subcode:#04X}");
+        let sector_count = data.len() / STORAGE_SECTOR_SIZE;
+        let sector_count_u16 =
+            u16::try_from(sector_count).map_err(|_| RkUsbError::Usb(rusb::Error::InvalidParam))?;
+
+        trace!("READ_LBA pos={pos:#010X} count={sector_count_u16:#06X} subcode={subcode:#04X}");
 
         let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x14); // READ_LBA
         cbw.data_transfer_length = data.len() as u32;
         cbw.cb.address = pos.to_be();
-        cbw.cb.length = count.to_be();
+        cbw.cb.length = sector_count_u16.to_be();
         cbw.cb.reserved = subcode;
 
         self.cbw_transaction(&cbw, None, Some(data), timeout)?;
         Ok(())
     }
 
-    fn erase_lba_raw(&mut self, pos: u32, count: u16, timeout: Duration) -> Result<(), RkUsbError> {
-        if count == 0 {
+    fn erase_lba_raw(
+        &mut self,
+        pos: u32,
+        sector_count: u16,
+        timeout: Duration,
+    ) -> Result<(), RkUsbError> {
+        if sector_count == 0 {
             debug!("Skipping empty LBA erase at start_sector={pos}");
             return Ok(());
         }
 
-        trace!("ERASE_LBA pos={pos:#010X} count={count:#06X}");
+        trace!("ERASE_LBA pos={pos:#010X} count={sector_count:#06X}");
 
         let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x25); // ERASE_LBA
         cbw.cb.address = pos.to_be();
-        cbw.cb.length = count.to_be();
+        cbw.cb.length = sector_count.to_be();
         self.cbw_transaction(&cbw, None, None, timeout)?;
         Ok(())
     }
@@ -583,16 +594,18 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         self.switch_storage(storage as u8)
     }
 
-    /// Write bytes to storage starting at the given LBA.
+    /// Write bytes to storage starting at the given sector.
+    ///
+    /// Even through this method named `write_lba`, the rkusb protocol runs with unit of sector (512 byte).
+    /// So always consider position and length in sectors. The device's underlying implementation abstracts away the LBA size difference.
     ///
     /// Transfers are batched automatically. If the last chunk is not a whole block,
     /// a read-modify-write is used to preserve remaining bytes.
     ///
     /// # Arguments
     ///
-    /// * `pos` - The index of the first LBA to be write.
+    /// * `pos` - The index of the first sector to be write.
     /// * `data` - The input buffer for this operation.
-    /// * `lba_sectors` - Size of the LBA in sectors. Can be obtained from [RkFlashInfo::lba_size].
     /// * `subcode` - `0` for "RWMETHOD_IMAGE" and `1` for "RWMETHOD_LBA". No idea what it means.
     /// * `timeout` - The timeout limit for the entire operation.
     ///
@@ -600,7 +613,6 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         &mut self,
         pos: u32,
         data: &[u8],
-        lba_sectors: usize,
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
@@ -610,32 +622,19 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         }
 
         let deadline = Instant::now() + timeout;
-        let aligned_len = data.len() - (data.len() % lba_sectors);
+        let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
         let (aligned, tail) = data.split_at(aligned_len);
         let mut next_pos = pos;
 
-        if !MAX_LBA_TRANSFER_SECTORS.is_multiple_of(lba_sectors as u64) {
-            error!("Unsupported LBA size: {lba_sectors}");
-            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
-        }
-
-        let max_transfer_count = (MAX_LBA_TRANSFER_SECTORS / lba_sectors as u64) as u16;
-        for chunk in aligned.chunks(MAX_LBA_TRANSFER_BYTES as usize) {
-            self.write_lba_raw(
-                next_pos,
-                max_transfer_count,
-                chunk,
-                subcode,
-                Self::remaining_timeout(deadline)?,
-            )?;
+        for chunk in aligned.chunks(MAX_LBA_TRANSFER_BYTES) {
+            self.write_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
             next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
         }
 
         if !tail.is_empty() {
-            let mut sector = vec![0u8; lba_sectors * STORAGE_SECTOR_SIZE as usize];
+            let mut sector = [0u8; STORAGE_SECTOR_SIZE];
             self.read_lba_raw(
                 next_pos,
-                lba_sectors as u16,
                 &mut sector,
                 subcode,
                 Self::remaining_timeout(deadline)?,
@@ -643,7 +642,6 @@ impl<T: rusb::UsbContext> RkDevice<T> {
             sector[..tail.len()].copy_from_slice(tail);
             self.write_lba_raw(
                 next_pos,
-                lba_sectors as u16,
                 &sector,
                 subcode,
                 Self::remaining_timeout(deadline)?,
@@ -653,16 +651,18 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         Ok(())
     }
 
-    /// Read bytes from storage starting at the given LBA.
+    /// Read bytes from storage starting at the given sector.
+    ///
+    /// Even through this method named `read_lba`, the rkusb protocol runs with unit of sector (512 byte).
+    /// So always consider position and length in sectors. The device's underlying implementation abstracts away the LBA size difference.
     ///
     /// Transfers are batched automatically. If the output length is not a whole
     /// sector, the trailing bytes are satisfied from one extra 512-byte read.
     ///
     /// # Arguments
     ///
-    /// * `pos` - The index of the first LBA to be read.
+    /// * `pos` - The index of the first sector to be read.
     /// * `data` - The output buffer for this operation.
-    /// * `lba_sectors` - Size of the LBA in sectors. Can be obtained from [RkFlashInfo::lba_size].
     /// * `subcode` - `0` for "RWMETHOD_IMAGE" and `1` for "RWMETHOD_LBA". No idea what it means.
     /// * `timeout` - The timeout limit for the entire operation.
     ///
@@ -670,7 +670,6 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         &mut self,
         pos: u32,
         data: &mut [u8],
-        lba_sectors: usize,
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
@@ -680,32 +679,19 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         }
 
         let deadline = Instant::now() + timeout;
-        let aligned_len = data.len() - (data.len() % lba_sectors);
+        let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
         let (aligned, tail) = data.split_at_mut(aligned_len);
         let mut next_pos = pos;
 
-        if !MAX_LBA_TRANSFER_SECTORS.is_multiple_of(lba_sectors as u64) {
-            error!("Unsupported LBA size: {lba_sectors}");
-            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
-        }
-
-        let max_transfer_count = (MAX_LBA_TRANSFER_SECTORS / lba_sectors as u64) as u16;
-        for chunk in aligned.chunks_mut(MAX_LBA_TRANSFER_BYTES as usize) {
-            self.read_lba_raw(
-                next_pos,
-                max_transfer_count,
-                chunk,
-                subcode,
-                Self::remaining_timeout(deadline)?,
-            )?;
+        for chunk in aligned.chunks_mut(MAX_LBA_TRANSFER_BYTES) {
+            self.read_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
             next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
         }
 
         if !tail.is_empty() {
-            let mut sector = vec![0u8; lba_sectors * STORAGE_SECTOR_SIZE as usize];
+            let mut sector = [0u8; STORAGE_SECTOR_SIZE];
             self.read_lba_raw(
                 next_pos,
-                lba_sectors as u16,
                 &mut sector,
                 subcode,
                 Self::remaining_timeout(deadline)?,
@@ -716,7 +702,10 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         Ok(())
     }
 
-    /// Erase sectors from storage starting at the given LBA
+    /// Erase sectors from storage starting at the given LBA.
+    ///
+    /// Even through this method named `erase_lba`, the rkusb protocol runs with unit of sector (512 byte).
+    /// So always consider position and counts in sectors. The device's underlying implementation abstracts away the LBA size difference.
     ///
     /// The range is split into device-sized commands automatically.
     ///

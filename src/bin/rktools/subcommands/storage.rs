@@ -201,9 +201,8 @@ fn exec_partition_read<T: rusb::UsbContext>(
     part: Partition,
     path: &str,
 ) -> Result<(), PartitionTransferError> {
-    let lb_size = *disk.logical_block_size();
     let output_len = part
-        .bytes_len(lb_size)
+        .bytes_len(*disk.logical_block_size())
         .inspect_err(|e| error!("failed to get partition byte length for read: {e}"))?;
     let output = OpenOptions::new()
         .read(true)
@@ -235,10 +234,6 @@ fn exec_partition_read<T: rusb::UsbContext>(
         .read_lba(
             pos,
             &mut output_map,
-            match lb_size {
-                LogicalBlockSize::Lb512 => 1,
-                LogicalBlockSize::Lb4096 => 8,
-            },
             DEFAULT_LBA_SUBCODE,
             DEFAULT_IO_TIMEOUT,
         )
@@ -260,7 +255,6 @@ fn exec_partition_write<T: rusb::UsbContext>(
     part: Partition,
     path: &str,
 ) -> Result<(), PartitionTransferError> {
-    let lb_size = *disk.logical_block_size();
     let input = File::open(path).inspect_err(|e| error!("failed to open input file: {e}"))?;
     let input_map = unsafe {
         // SAFETY: input file is opened read-only and the mapping is read-only.
@@ -272,7 +266,7 @@ fn exec_partition_write<T: rusb::UsbContext>(
         .inspect_err(|e| error!("input length does not fit in u64: {e}"))
         .map_err(|_| PartitionTransferError::SizeOverflow)?;
     let partition_bytes = part
-        .bytes_len(lb_size)
+        .bytes_len(*disk.logical_block_size())
         .inspect_err(|e| error!("failed to get partition byte length for write: {e}"))?;
     if input_len > partition_bytes {
         error!(
@@ -285,16 +279,7 @@ fn exec_partition_write<T: rusb::UsbContext>(
         .inspect_err(|e| error!("partition first_lba is out of u32 range for write: {e}"))
         .map_err(|_| PartitionTransferError::LbaOverflow)?;
     disk.device_mut()
-        .write_lba(
-            pos,
-            &input_map,
-            match lb_size {
-                LogicalBlockSize::Lb512 => 1,
-                LogicalBlockSize::Lb4096 => 8,
-            },
-            DEFAULT_LBA_SUBCODE,
-            DEFAULT_IO_TIMEOUT,
-        )
+        .write_lba(pos, &input_map, DEFAULT_LBA_SUBCODE, DEFAULT_IO_TIMEOUT)
         .inspect_err(|e| error!("device write_lba failed: {e}"))
         .map_err(|_| PartitionTransferError::DeviceTransfer)?;
 
