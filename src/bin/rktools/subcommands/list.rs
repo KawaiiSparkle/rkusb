@@ -33,10 +33,9 @@ pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), Box<dyn std::erro
                     }
                 }
                 println!(
-                    "Bus {:03} Device {:03} Mode: {:?}",
+                    "Bus {:03} Device {:03} Mode: {rkusb_type:?}",
                     device.bus_number(),
                     device.address(),
-                    rkusb_type
                 );
             }
         }

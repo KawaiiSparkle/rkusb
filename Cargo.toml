@@ -22,3 +22,17 @@ rand = "0.10"
 hex = "0.4"
 rc4 = "0.2"
 gpt = { version = "4.1", features = ["log"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_WinRT",
+    "Win32_System_IO",
+], optional = true }
+
+[features]
+default = ["rockusb"]
+rockusb = ["dep:windows"]

@@ -4,19 +4,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crc::{CRC_16_IBM_3740, Crc};
+use crc::{Crc, CRC_16_IBM_3740};
 use humansize::SizeFormatter;
 use log::{debug, info, trace};
 use thiserror::Error;
 use zerocopy::{
-    FromBytes, TryFromBytes,
     little_endian::{U16, U32},
+    FromBytes, TryFromBytes,
 };
 
 use crate::{
     image::{RkBootEntryType, RkBootImage},
     usb::CSW_SIGN,
 };
+
+pub(crate) mod checksum;
+pub mod idblock;
+pub mod image;
+pub mod usb;
+
+#[cfg(all(target_os = "windows", feature = "rockusb"))]
+mod rockusb;
 
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
 const STORAGE_SECTOR_SIZE: usize = 512;
@@ -143,11 +151,6 @@ fn flash_manuf_name(code: u8) -> &'static str {
         _ => "Unknown",
     }
 }
-
-pub(crate) mod checksum;
-pub mod idblock;
-pub mod image;
-mod usb;
 
 #[repr(C)]
 pub enum RkDeviceType {
@@ -406,7 +409,7 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         })
     }
 
-    fn device_request(&mut self, dw_request: u16, data: &[u8]) -> Result<(), RkUsbError> {
+    fn vendor_request(&mut self, dw_request: u16, data: &[u8]) -> Result<(), RkUsbError> {
         const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_3740);
         let crc16 = CRC.checksum(data);
         debug!(
@@ -519,12 +522,12 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     pub fn download_boot(&mut self, boot_img: RkBootImage) -> Result<(), RkUsbError> {
         for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry471) {
             info!("Downloading {name} with request 0x0471");
-            self.device_request(0x0471, data)?;
+            self.vendor_request(0x0471, data)?;
             sleep(delay);
         }
         for (name, data, delay) in boot_img.iter_entries(RkBootEntryType::Entry472) {
             info!("Downloading {name} with request 0x0472");
-            self.device_request(0x0472, data)?;
+            self.vendor_request(0x0472, data)?;
             sleep(delay);
         }
         Ok(())
