@@ -21,6 +21,7 @@ use crate::{
 pub(crate) mod checksum;
 pub mod idblock;
 pub mod image;
+pub mod otp;
 pub mod usb;
 
 #[cfg(all(target_os = "windows", feature = "rockusb"))]
@@ -390,6 +391,16 @@ pub fn decode_serial_number(buf: &[u8]) -> Result<Option<String>, RkUsbError> {
 
 pub fn is_vendor_storage_lba(pos: u32) -> bool {
     pos >= VENDOR_LBA_BASE
+}
+
+/// LE 4-character chip tag from READ_CHIP_INFO, e.g. `"3588"`.
+pub fn chip_info_tag(buf: &[u8; 16]) -> String {
+    let chars = [buf[3], buf[2], buf[1], buf[0]];
+    if chars.iter().all(|c| c.is_ascii_alphanumeric()) {
+        String::from_utf8_lossy(&chars).into_owned()
+    } else {
+        format!("{:02x}{:02x}{:02x}{:02x}", buf[3], buf[2], buf[1], buf[0])
+    }
 }
 
 /// Check that `[start, start+count)` fits in `flash_sectors`.
@@ -1169,6 +1180,17 @@ impl<T: rusb::UsbContext> RkDevice<T> {
             return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
         }
         self.write_vendor_storage(item as u16, backend, &mac)
+    }
+
+    /// Read SoC chip info (opcode 0x1B). First four bytes are a LE ASCII tag
+    /// such as `3588` / `3568`.
+    pub fn read_chip_info(&mut self) -> Result<[u8; 16], RkUsbError> {
+        debug!("Reading chip info");
+        let mut buf = [0u8; 16];
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x1B); // READ_CHIP_INFO
+        cbw.data_transfer_length = buf.len() as u32;
+        self.cbw_transaction(&cbw, None, Some(&mut buf), USB_TIMEOUT)?;
+        Ok(buf)
     }
 
     /// Dump chip OTP / eFuse bytes (xrock `otp`, opcode 0x2C).

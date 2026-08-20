@@ -261,11 +261,13 @@ rktools vendor write bt-mac 88:A9:A7:00:BC:66
 rktools vendor read imei
 ```
 
-OTP dump uses opcode `0x2C`.
+OTP dump uses opcode `0x2C` and is decoded against the Linux/U-Boot NS OTP map for the SoC (CPUID, cpu-code, leakage bins). Secure Boot key hash lives in *secure* OTP and is usually **not** in this dump.
 
 ```sh
-rktools otp
+rktools otp                  # 128-byte dump + named fields (auto map from chip info)
 rktools otp 256
+rktools otp --map rk3588
+rktools otp --raw            # hex only
 ```
 
 ### Upgrade loader by writing an IDBlock
