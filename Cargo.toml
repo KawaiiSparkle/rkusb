@@ -36,3 +36,4 @@ windows = { version = "0.62.2", features = [
 [features]
 default = ["rockusb"]
 rockusb = ["dep:windows"]
+vendored = ["rusb/vendored"]

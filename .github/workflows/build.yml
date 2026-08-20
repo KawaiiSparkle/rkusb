@@ -1,8 +1,6 @@
 name: build
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -47,10 +45,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo test --target ${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
@@ -91,12 +89,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release
-        run: cross build --release --locked --target ${{ matrix.target }} --features vendored
+        run: cross build --release --target ${{ matrix.target }} --features vendored
 
       - name: Package artifact
         run: tar -C target/${{ matrix.target }}/release -czvf rktools-${{ matrix.target }}.tar.gz rktools
