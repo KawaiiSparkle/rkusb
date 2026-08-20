@@ -234,21 +234,37 @@ This is the batch-read flow similar to spreadtrum_flash `r all` / `read_parts`:
 - Writes `<storage>_<size>_partition_table.txt` first
 - Reads each GPT partition to `<name>.img` with a per-partition progress bar
 
-### Serial number and OTP
+### Serial number and vendor storage (RKDevInfoWriteTool)
 
-Serial number access uses the same vendor-storage LBA as xrock (`0xFFF00001`). OTP dump uses opcode `0x2C`.
+In loader mode RKDevInfoWriteTool writes SN / WiFi MAC / LAN MAC / BT MAC into vendor storage. The loader exposes that through:
+
+1. Special LBA `0xFFF00001` for SN (`valid:u32le`, `len:u32le`, payload) — same as xrock `sn`
+2. Opcodes `0x26` (WRITE) / `0x27` (READ) with item id + backend type — same as xrock `vs`
+
+Item IDs match the kernel (`rk_vendor_storage.h`): `1=SN`, `2=WIFI MAC`, `3=LAN MAC`, `4=BT MAC`, `15=IMEI`. `--backend rpmb` selects eMMC RPMB (RKDevInfoWriteTool default on RK3588); `--backend vendor` uses the `vnvm` partition.
 
 ```sh
-# read SN
+# SN (tries LBA 0xFFF00001, then vendor item 1)
 rktools sn
-
-# write SN
 rktools sn write RK3588-TEST-001
+rktools sn --backend rpmb write RK3588-TEST-001
 
-# dump 64 bytes of chip OTP (default length)
+# dump SN + MACs
+rktools vendor dump
+rktools vendor dump --backend rpmb
+
+# individual items
+rktools vendor read sn
+rktools vendor write wifi-mac 88:A9:A7:00:BC:64
+rktools vendor write lan-mac 88A9A700BC95
+rktools vendor write bt-mac 88:A9:A7:00:BC:66
+rktools vendor read imei
+```
+
+OTP dump uses opcode `0x2C`.
+
+```sh
 rktools otp
-
-# dump 256 bytes
 rktools otp 256
 ```
 

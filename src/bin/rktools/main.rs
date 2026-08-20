@@ -45,6 +45,11 @@ enum Commands {
     UpgradeLoader(subcommands::upgrade_loader::Args),
     #[command(about = "Read or write device serial number", visible_alias("serial"))]
     Sn(subcommands::sn::Args),
+    #[command(
+        about = "Read/write vendor storage (SN, MAC, IMEI) like RKDevInfoWriteTool",
+        visible_alias("vs")
+    )]
+    Vendor(subcommands::vendor::Args),
     #[command(about = "Dump chip OTP / eFuse (xrock otp)")]
     Otp(subcommands::otp::Args),
 }
@@ -72,6 +77,7 @@ fn handle_command(cmd: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             subcommands::upgrade_loader::exec(rusb::Context::new()?, args)?
         }
         Commands::Sn(args) => subcommands::sn::exec(rusb::Context::new()?, args)?,
+        Commands::Vendor(args) => subcommands::vendor::exec(rusb::Context::new()?, args)?,
         Commands::Otp(args) => subcommands::otp::exec(rusb::Context::new()?, args)?,
     }
     Ok(())

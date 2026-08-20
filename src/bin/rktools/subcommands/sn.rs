@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::Subcommand;
-use rkusb::RkDevice;
+use rkusb::{RkDevice, VendorBackend};
 
 use crate::common;
 
@@ -13,6 +13,12 @@ pub struct Args {
     addr: Option<u8>,
     #[arg(long, value_parser = humantime::parse_duration, help = "Wait for device with timeout (e.g., 30s, 1m)")]
     wait: Option<Duration>,
+    #[arg(
+        long,
+        default_value = "vendor",
+        help = "RKDevInfoWriteTool backend: vendor (vnvm) or rpmb"
+    )]
+    backend: String,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -28,16 +34,18 @@ enum Command {
 }
 
 pub fn exec(usb_ctx: rusb::Context, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = VendorBackend::parse(&args.backend)
+        .ok_or_else(|| format!("unknown backend '{}' (vendor|rpmb)", args.backend))?;
     let selected_device = common::find_device(&usb_ctx, args.bus, args.addr, args.wait)?;
     let mut rkdev = RkDevice::open(&selected_device)?;
 
     match &args.command {
-        None => match rkdev.read_sn()? {
+        None => match rkdev.read_sn_with_backend(backend)? {
             Some(sn) => println!("SN: {sn}"),
             None => println!("No serial number"),
         },
         Some(Command::Write { sn }) => {
-            rkdev.write_sn(sn)?;
+            rkdev.write_sn_with_backend(sn, backend)?;
             println!("Write serial number '{sn}'");
         }
     }

@@ -62,6 +62,10 @@ pub enum RkUsbError {
     VendorStorageUnsupported,
     #[error("loader does not support OTP read")]
     OtpUnsupported,
+    #[error("vendor storage payload too large (max {max} bytes)")]
+    VendorPayloadTooLarge { max: usize },
+    #[error("invalid MAC address '{0}'")]
+    InvalidMac(String),
     #[error("Duplicate bulk endpoint detected in USB interface descriptor")]
     DuplicateBulkEndpoint,
     #[error("CBW/CSW tag mismatch")]
@@ -998,23 +1002,173 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         }
     }
 
-    /// Read the device serial number from vendor storage (xrock `sn`).
-    pub fn read_sn(&mut self) -> Result<Option<String>, RkUsbError> {
+    fn vendor_storage_cbw(
+        opcode: u8,
+        index: u16,
+        backend: VendorBackend,
+        len: u16,
+    ) -> usb::Cbw<usb::Cbwcb> {
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(opcode);
+        cbw.data_transfer_length = len as u32;
+        // CDB address = index (BE16) || type (BE16), matching xrock vs_read/vs_write.
+        cbw.cb.address = ((index as u32) << 16 | backend as u32).to_be();
+        cbw.cb.length = len.to_be();
+        cbw
+    }
+
+    /// Read a vendor-storage item (RKDevInfoWriteTool / xrock `vs`, opcode 0x27).
+    pub fn read_vendor_storage(
+        &mut self,
+        index: u16,
+        backend: VendorBackend,
+        buf: &mut [u8],
+    ) -> Result<usize, RkUsbError> {
+        if buf.is_empty() || buf.len() > VENDOR_STORAGE_MAX {
+            return Err(RkUsbError::VendorPayloadTooLarge {
+                max: VENDOR_STORAGE_MAX,
+            });
+        }
         if !self.loader_supports_vendor_storage()? {
             return Err(RkUsbError::VendorStorageUnsupported);
         }
+        let len = u16::try_from(buf.len()).map_err(|_| RkUsbError::VendorPayloadTooLarge {
+            max: VENDOR_STORAGE_MAX,
+        })?;
+        debug!(
+            "READ_VENDOR_STORAGE index={index} backend={} len={len}",
+            backend.name()
+        );
+        let cbw = Self::vendor_storage_cbw(0x27, index, backend, len);
+        self.cbw_transaction(&cbw, None, Some(buf), USB_TIMEOUT)
+    }
+
+    /// Write a vendor-storage item (RKDevInfoWriteTool / xrock `vs`, opcode 0x26).
+    pub fn write_vendor_storage(
+        &mut self,
+        index: u16,
+        backend: VendorBackend,
+        data: &[u8],
+    ) -> Result<(), RkUsbError> {
+        if data.is_empty() || data.len() > VENDOR_STORAGE_MAX {
+            return Err(RkUsbError::VendorPayloadTooLarge {
+                max: VENDOR_STORAGE_MAX,
+            });
+        }
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        let len = u16::try_from(data.len()).map_err(|_| RkUsbError::VendorPayloadTooLarge {
+            max: VENDOR_STORAGE_MAX,
+        })?;
+        debug!(
+            "WRITE_VENDOR_STORAGE index={index} backend={} len={len}",
+            backend.name()
+        );
+        let cbw = Self::vendor_storage_cbw(0x26, index, backend, len);
+        self.cbw_transaction(&cbw, Some(data), None, USB_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn read_sn_via_lba(&mut self) -> Result<Option<String>, RkUsbError> {
         let mut buf = [0u8; STORAGE_SECTOR_SIZE];
         self.read_lba(VENDOR_SN_LBA, &mut buf, 0, USB_TIMEOUT)?;
         decode_serial_number(&buf)
     }
 
-    /// Write the device serial number to vendor storage (xrock `sn <string>`).
-    pub fn write_sn(&mut self, sn: &str) -> Result<(), RkUsbError> {
+    fn read_sn_via_vs(&mut self, backend: VendorBackend) -> Result<Option<String>, RkUsbError> {
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        let n = self.read_vendor_storage(VendorItemId::Sn as u16, backend, &mut buf)?;
+        let data = &buf[..n.min(buf.len())];
+        if let Ok(Some(sn)) = decode_serial_number(data) {
+            return Ok(Some(sn));
+        }
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let s = String::from_utf8_lossy(&data[..end]).into_owned();
+        if s.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(s))
+        }
+    }
+
+    /// Read SN the way RKDevInfoWriteTool / xrock do in loader mode.
+    ///
+    /// Tries the special LBA `0xFFF00001` first, then vendor-storage opcode 0x27
+    /// with `VENDOR_SN_ID` (1).
+    pub fn read_sn(&mut self) -> Result<Option<String>, RkUsbError> {
+        self.read_sn_with_backend(VendorBackend::Vendor)
+    }
+
+    pub fn read_sn_with_backend(
+        &mut self,
+        backend: VendorBackend,
+    ) -> Result<Option<String>, RkUsbError> {
         if !self.loader_supports_vendor_storage()? {
             return Err(RkUsbError::VendorStorageUnsupported);
         }
-        let buf = encode_serial_number(sn)?;
-        self.write_lba(VENDOR_SN_LBA, &buf, 0, USB_TIMEOUT)
+        match self.read_sn_via_lba() {
+            Ok(Some(sn)) => return Ok(Some(sn)),
+            Ok(None) => {}
+            Err(err) => debug!("SN LBA 0xFFF00001 read failed: {err}"),
+        }
+        self.read_sn_via_vs(backend)
+    }
+
+    /// Write SN via the special LBA *and* vendor-storage opcode, matching
+    /// RKDevInfoWriteTool's loader write (SN + vendor item 1).
+    pub fn write_sn(&mut self, sn: &str) -> Result<(), RkUsbError> {
+        self.write_sn_with_backend(sn, VendorBackend::Vendor)
+    }
+
+    pub fn write_sn_with_backend(
+        &mut self,
+        sn: &str,
+        backend: VendorBackend,
+    ) -> Result<(), RkUsbError> {
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        let sector = encode_serial_number(sn)?;
+        self.write_lba(VENDOR_SN_LBA, &sector, 0, USB_TIMEOUT)?;
+        // Raw SN bytes on item 1 — same ID the kernel `vendor_storage` tool uses.
+        if !sn.is_empty() {
+            if let Err(err) =
+                self.write_vendor_storage(VendorItemId::Sn as u16, backend, sn.as_bytes())
+            {
+                debug!("vendor-storage opcode SN write failed (LBA write succeeded): {err}");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_mac(
+        &mut self,
+        item: VendorItemId,
+        backend: VendorBackend,
+    ) -> Result<Option<[u8; 6]>, RkUsbError> {
+        if !item.is_mac() {
+            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
+        }
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        let n = self.read_vendor_storage(item as u16, backend, &mut buf)?;
+        if n < 6 || buf[..6].iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[..6]);
+        Ok(Some(mac))
+    }
+
+    pub fn write_mac(
+        &mut self,
+        item: VendorItemId,
+        backend: VendorBackend,
+        mac: [u8; 6],
+    ) -> Result<(), RkUsbError> {
+        if !item.is_mac() {
+            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
+        }
+        self.write_vendor_storage(item as u16, backend, &mac)
     }
 
     /// Dump chip OTP / eFuse bytes (xrock `otp`, opcode 0x2C).
@@ -1089,5 +1243,26 @@ mod tests {
         assert_eq!(storage_name(9), "SPI NOR");
         assert_eq!(storage_slug(9), "SPINOR");
         assert_eq!(storage_slug(99), "storage99");
+    }
+
+    #[test]
+    fn mac_parse_and_format() {
+        assert_eq!(
+            parse_mac("88:A9:A7:00:BC:64").unwrap(),
+            [0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]
+        );
+        assert_eq!(
+            parse_mac("88a9a700bc64").unwrap(),
+            [0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]
+        );
+        assert_eq!(format_mac(&[0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]), "88:A9:A7:00:BC:64");
+        assert!(parse_mac("not-a-mac").is_err());
+    }
+
+    #[test]
+    fn vendor_item_slug_roundtrip() {
+        assert_eq!(VendorItemId::parse_slug("sn"), Some(VendorItemId::Sn));
+        assert_eq!(VendorItemId::parse_slug("wifi-mac"), Some(VendorItemId::WifiMac));
+        assert_eq!(VendorBackend::parse("rpmb"), Some(VendorBackend::Rpmb));
     }
 }

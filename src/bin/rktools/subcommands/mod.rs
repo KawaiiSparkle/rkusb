@@ -6,5 +6,6 @@ pub mod otp;
 pub mod reset;
 pub mod sn;
 pub mod storage;
+pub mod vendor;
 pub mod upgrade_loader;
 pub mod wait;
