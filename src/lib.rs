@@ -36,6 +36,10 @@ const MAX_LBA_TRANSFER_BYTES: usize = MAX_LBA_TRANSFER_SECTORS * STORAGE_SECTOR_
 /// Loader-interpreted vendor-storage LBA used by xrock for the serial number.
 pub const VENDOR_SN_LBA: u32 = 0xFFF0_0001;
 const VENDOR_LBA_BASE: u32 = 0xFFF0_0000;
+/// Maximum payload in bytes for one vendor-storage read/write (opcodes
+/// 0x26/0x27). xrock clamps `vs` transfers to 512 bytes and a Rockchip vendor
+/// item fits in a single 512-byte sector, so one sector bounds any item.
+pub const VENDOR_STORAGE_MAX: usize = STORAGE_SECTOR_SIZE;
 const SN_HEADER_LEN: usize = 8;
 const SN_MAX_LEN: usize = STORAGE_SECTOR_SIZE - SN_HEADER_LEN;
 
@@ -387,6 +391,122 @@ pub fn decode_serial_number(buf: &[u8]) -> Result<Option<String>, RkUsbError> {
     Ok(Some(
         String::from_utf8_lossy(&buf[SN_HEADER_LEN..SN_HEADER_LEN + len]).into_owned(),
     ))
+}
+
+/// Vendor-storage backend selected by the CDB `type` field of the
+/// vendor-storage opcodes (0x26/0x27).
+///
+/// Values match Rockchip's loader-side implementation
+/// (`drivers/usb/gadget/f_rockusb.c` in the BSP U-Boot): 0 selects the
+/// `vnvm` vendor-storage partition, 1 selects eMMC RPMB — the backend
+/// RKDevInfoWriteTool defaults to on RK3588.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorBackend {
+    /// Vendor-storage (`vnvm`) partition.
+    Vendor = 0,
+    /// eMMC RPMB secure storage.
+    Rpmb = 1,
+}
+
+impl VendorBackend {
+    /// Parse a backend name (`vendor`/`vnvm` or `rpmb`, case-insensitive).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "vendor" | "vnvm" => Some(Self::Vendor),
+            "rpmb" => Some(Self::Rpmb),
+            _ => None,
+        }
+    }
+
+    /// CLI/log-friendly backend name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vendor => "vendor",
+            Self::Rpmb => "rpmb",
+        }
+    }
+}
+
+/// Well-known vendor-storage item IDs, matching the kernel
+/// `rk_vendor_storage.h` / RKDevInfoWriteTool numbering.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorItemId {
+    Sn = 1,
+    WifiMac = 2,
+    LanMac = 3,
+    BtMac = 4,
+    Imei = 15,
+}
+
+impl VendorItemId {
+    /// Map a vendor-storage item id to a known item.
+    pub fn from_code(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Sn),
+            2 => Some(Self::WifiMac),
+            3 => Some(Self::LanMac),
+            4 => Some(Self::BtMac),
+            15 => Some(Self::Imei),
+            _ => None,
+        }
+    }
+
+    /// Parse a CLI-friendly item name (`sn`, `wifi-mac`, `lan-mac`,
+    /// `bt-mac`, `imei`, case-insensitive).
+    pub fn parse_slug(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "sn" => Some(Self::Sn),
+            "wifi-mac" => Some(Self::WifiMac),
+            "lan-mac" => Some(Self::LanMac),
+            "bt-mac" => Some(Self::BtMac),
+            "imei" => Some(Self::Imei),
+            _ => None,
+        }
+    }
+
+    /// Display name used by the CLI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sn => "SN",
+            Self::WifiMac => "WiFi MAC",
+            Self::LanMac => "LAN MAC",
+            Self::BtMac => "BT MAC",
+            Self::Imei => "IMEI",
+        }
+    }
+
+    /// Whether this item holds a 6-byte MAC address.
+    pub fn is_mac(self) -> bool {
+        matches!(self, Self::WifiMac | Self::LanMac | Self::BtMac)
+    }
+}
+
+/// Parse a MAC address given as `XX:XX:XX:XX:XX:XX`, with `-`/`.` separators,
+/// or as 12 bare hex digits.
+pub fn parse_mac(s: &str) -> Result<[u8; 6], RkUsbError> {
+    let digits: String = s
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.'))
+        .collect();
+    if digits.len() != 12 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(RkUsbError::InvalidMac(s.to_string()));
+    }
+    let mut mac = [0u8; 6];
+    for (i, byte) in mac.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16)
+            .map_err(|_| RkUsbError::InvalidMac(s.to_string()))?;
+    }
+    Ok(mac)
+}
+
+/// Format a MAC address as uppercase `XX:XX:XX:XX:XX:XX`.
+pub fn format_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 pub fn is_vendor_storage_lba(pos: u32) -> bool {
