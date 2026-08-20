@@ -21,15 +21,23 @@ use crate::{
 pub(crate) mod checksum;
 pub mod idblock;
 pub mod image;
+pub mod otp;
 pub mod usb;
 
 #[cfg(all(target_os = "windows", feature = "rockusb"))]
 mod rockusb;
 
-const USB_TIMEOUT: Duration = Duration::from_secs(5);
-const STORAGE_SECTOR_SIZE: usize = 512;
+/// Per USB CBW-transaction timeout. Large LBA transfers iterate in chunks and
+/// apply this budget to each chunk instead of the whole operation.
+pub const USB_TIMEOUT: Duration = Duration::from_secs(5);
+pub const STORAGE_SECTOR_SIZE: usize = 512;
 const MAX_LBA_TRANSFER_SECTORS: usize = 128;
 const MAX_LBA_TRANSFER_BYTES: usize = MAX_LBA_TRANSFER_SECTORS * STORAGE_SECTOR_SIZE;
+/// Loader-interpreted vendor-storage LBA used by xrock for the serial number.
+pub const VENDOR_SN_LBA: u32 = 0xFFF0_0001;
+const VENDOR_LBA_BASE: u32 = 0xFFF0_0000;
+const SN_HEADER_LEN: usize = 8;
+const SN_MAX_LEN: usize = STORAGE_SECTOR_SIZE - SN_HEADER_LEN;
 
 #[derive(Error, Debug, Clone)]
 pub enum RkUsbError {
@@ -37,6 +45,28 @@ pub enum RkUsbError {
     Usb(#[from] rusb::Error),
     #[error("LBA range overflow")]
     LbaOverflow,
+    #[error(
+        "LBA out of range: start={start:#x} count={count} exceeds flash size {flash_sectors} sectors"
+    )]
+    LbaOutOfRange {
+        start: u32,
+        count: u32,
+        flash_sectors: u32,
+    },
+    #[error("serial number too long (max {max} bytes)")]
+    SnTooLong { max: usize },
+    #[error("invalid serial number data")]
+    SnInvalid,
+    #[error("OTP length must be greater than 0")]
+    InvalidOtpLength,
+    #[error("loader does not support vendor storage (serial number)")]
+    VendorStorageUnsupported,
+    #[error("loader does not support OTP read")]
+    OtpUnsupported,
+    #[error("vendor storage payload too large (max {max} bytes)")]
+    VendorPayloadTooLarge { max: usize },
+    #[error("invalid MAC address '{0}'")]
+    InvalidMac(String),
     #[error("Duplicate bulk endpoint detected in USB interface descriptor")]
     DuplicateBulkEndpoint,
     #[error("CBW/CSW tag mismatch")]
@@ -135,6 +165,16 @@ impl RkFlashInfo {
         } else {
             self.manufacture as u64 - 200
         }
+    }
+
+    /// Total flash size in 512-byte sectors.
+    pub fn flash_size_sectors(&self) -> u32 {
+        self.flash_size.get()
+    }
+
+    /// Total flash size in bytes (512-byte protocol sectors).
+    pub fn flash_size_bytes(&self) -> u64 {
+        self.flash_size_sectors() as u64 * STORAGE_SECTOR_SIZE as u64
     }
 }
 
@@ -251,6 +291,141 @@ pub enum RkStorageType {
     Ufs = 12,
 }
 
+impl RkStorageType {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Emmc),
+            2 => Some(Self::Sd0),
+            3 => Some(Self::Sd1),
+            7 => Some(Self::Nand),
+            8 => Some(Self::SpiNand),
+            9 => Some(Self::SpiNor),
+            10 => Some(Self::Sata),
+            11 => Some(Self::Pcie),
+            12 => Some(Self::Ufs),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Emmc => "eMMC",
+            Self::Sd0 => "SD",
+            Self::Sd1 => "SD1",
+            Self::Nand => "NAND",
+            Self::SpiNand => "SPI NAND",
+            Self::SpiNor => "SPI NOR",
+            Self::Sata => "SATA",
+            Self::Pcie => "NVMe",
+            Self::Ufs => "UFS",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Emmc => "eMMC",
+            Self::Sd0 => "SD",
+            Self::Sd1 => "SD1",
+            Self::Nand => "NAND",
+            Self::SpiNand => "SPINAND",
+            Self::SpiNor => "SPINOR",
+            Self::Sata => "SATA",
+            Self::Pcie => "NVMe",
+            Self::Ufs => "UFS",
+        }
+    }
+}
+
+impl std::fmt::Display for RkStorageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Human-readable name for a Rockchip storage code.
+pub fn storage_name(code: u8) -> &'static str {
+    RkStorageType::from_code(code)
+        .map(RkStorageType::name)
+        .unwrap_or("Unknown")
+}
+
+/// Filename-safe storage type token used for dump labels.
+pub fn storage_slug(code: u8) -> String {
+    RkStorageType::from_code(code)
+        .map(|t| t.slug().to_string())
+        .unwrap_or_else(|| format!("storage{code}"))
+}
+
+/// Encode a serial number into the 512-byte vendor-storage SN sector used by xrock.
+pub fn encode_serial_number(sn: &str) -> Result<[u8; STORAGE_SECTOR_SIZE], RkUsbError> {
+    let bytes = sn.as_bytes();
+    if bytes.len() > SN_MAX_LEN {
+        return Err(RkUsbError::SnTooLong { max: SN_MAX_LEN });
+    }
+    let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+    buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf[8..8 + bytes.len()].copy_from_slice(bytes);
+    Ok(buf)
+}
+
+/// Decode a serial number from the 512-byte vendor-storage SN sector used by xrock.
+///
+/// Returns `Ok(None)` when the sector is present but marked invalid (no SN).
+pub fn decode_serial_number(buf: &[u8]) -> Result<Option<String>, RkUsbError> {
+    if buf.len() < SN_HEADER_LEN {
+        return Err(RkUsbError::SnInvalid);
+    }
+    let valid = u32::from_le_bytes(buf[0..4].try_into().map_err(|_| RkUsbError::SnInvalid)?);
+    let len = u32::from_le_bytes(buf[4..8].try_into().map_err(|_| RkUsbError::SnInvalid)?) as usize;
+    if valid != 1 {
+        return Ok(None);
+    }
+    if len > buf.len().saturating_sub(SN_HEADER_LEN) || len > SN_MAX_LEN {
+        return Err(RkUsbError::SnInvalid);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&buf[SN_HEADER_LEN..SN_HEADER_LEN + len]).into_owned(),
+    ))
+}
+
+pub fn is_vendor_storage_lba(pos: u32) -> bool {
+    pos >= VENDOR_LBA_BASE
+}
+
+/// LE 4-character chip tag from READ_CHIP_INFO, e.g. `"3588"`.
+pub fn chip_info_tag(buf: &[u8; 16]) -> String {
+    let chars = [buf[3], buf[2], buf[1], buf[0]];
+    if chars.iter().all(|c| c.is_ascii_alphanumeric()) {
+        String::from_utf8_lossy(&chars).into_owned()
+    } else {
+        format!("{:02x}{:02x}{:02x}{:02x}", buf[3], buf[2], buf[1], buf[0])
+    }
+}
+
+/// Check that `[start, start+count)` fits in `flash_sectors`.
+///
+/// Vendor-storage LBAs (0xFFF00000+) and an unknown flash size (`0`) skip the check.
+pub fn check_lba_range(start: u32, count: u32, flash_sectors: u32) -> Result<(), RkUsbError> {
+    if count == 0 || is_vendor_storage_lba(start) || flash_sectors == 0 {
+        return Ok(());
+    }
+    let end = start.checked_add(count).ok_or(RkUsbError::LbaOverflow)?;
+    if end > flash_sectors {
+        return Err(RkUsbError::LbaOutOfRange {
+            start,
+            count,
+            flash_sectors,
+        });
+    }
+    Ok(())
+}
+
+fn sector_count_for_bytes(len: usize) -> Result<u32, RkUsbError> {
+    let sectors = len.div_ceil(STORAGE_SECTOR_SIZE);
+    u32::try_from(sectors).map_err(|_| RkUsbError::LbaOverflow)
+}
+
 impl RkUsbType {
     /// Detect the Rockchip USB mode from a USB device descriptor.
     pub fn detect(desc: &rusb::DeviceDescriptor) -> Option<Self> {
@@ -280,6 +455,7 @@ pub struct RkDevice<T: rusb::UsbContext> {
     device: rusb::DeviceHandle<T>,
     bulk_in: u8,
     bulk_out: u8,
+    flash_sectors: Option<u32>,
 }
 
 impl<T: rusb::UsbContext> RkDevice<T> {
@@ -302,6 +478,17 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         data_out: Option<&[u8]>,
         data_in: Option<&mut [u8]>,
         timeout: Duration,
+    ) -> Result<usize, RkUsbError> {
+        self.cbw_transaction_ex(cbw, data_out, data_in, timeout, true)
+    }
+
+    fn cbw_transaction_ex(
+        &mut self,
+        cbw: &usb::Cbw<usb::Cbwcb>,
+        data_out: Option<&[u8]>,
+        data_in: Option<&mut [u8]>,
+        timeout: Duration,
+        require_full_in: bool,
     ) -> Result<usize, RkUsbError> {
         let deadline = Instant::now() + timeout;
 
@@ -334,7 +521,10 @@ impl<T: rusb::UsbContext> RkDevice<T> {
                 .device
                 .read_bulk(self.bulk_in, buf, Self::remaining_timeout(deadline)?)?;
             let expected_min = cbw.data_transfer_length as usize;
-            if n < expected_min || n > buf.len() {
+            if n == 0 || n > buf.len() {
+                return Err(RkUsbError::Usb(rusb::Error::Io));
+            }
+            if require_full_in && n < expected_min {
                 return Err(RkUsbError::Usb(rusb::Error::Io));
             }
             n
@@ -406,7 +596,30 @@ impl<T: rusb::UsbContext> RkDevice<T> {
             bulk_out: *bulk_out
                 .get()
                 .ok_or(RkUsbError::Usb(rusb::Error::NotFound))?,
+            flash_sectors: None,
         })
+    }
+
+    fn flash_sector_count_cached(&mut self) -> Result<u32, RkUsbError> {
+        if let Some(sectors) = self.flash_sectors {
+            return Ok(sectors);
+        }
+        match self.read_storage_info() {
+            Ok(info) => {
+                let sectors = info.flash_size_sectors();
+                self.flash_sectors = Some(sectors);
+                Ok(sectors)
+            }
+            Err(err) => {
+                debug!("Unable to read flash size for LBA range check: {err}");
+                Ok(0)
+            }
+        }
+    }
+
+    fn ensure_lba_range(&mut self, pos: u32, count: u32) -> Result<(), RkUsbError> {
+        let flash_sectors = self.flash_sector_count_cached()?;
+        check_lba_range(pos, count, flash_sectors)
     }
 
     fn vendor_request(&mut self, dw_request: u16, data: &[u8]) -> Result<(), RkUsbError> {
@@ -589,6 +802,7 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x2A); // CHANGE_STORAGE
         cbw.cb.reserved = storage;
         self.cbw_transaction(&cbw, None, None, USB_TIMEOUT)?;
+        self.flash_sectors = None;
         Ok(())
     }
 
@@ -605,12 +819,15 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     /// Transfers are batched automatically. If the last chunk is not a whole block,
     /// a read-modify-write is used to preserve remaining bytes.
     ///
+    /// The LBA range is checked against the current flash size before any write.
+    /// `timeout` is applied to each USB transfer chunk, not the whole operation.
+    ///
     /// # Arguments
     ///
     /// * `pos` - The index of the first sector to be write.
     /// * `data` - The input buffer for this operation.
     /// * `subcode` - `0` for "RWMETHOD_IMAGE" and `1` for "RWMETHOD_LBA". No idea what it means.
-    /// * `timeout` - The timeout limit for the entire operation.
+    /// * `timeout` - USB timeout for each transfer chunk.
     ///
     pub fn write_lba(
         &mut self,
@@ -619,36 +836,45 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
+        self.write_lba_with_progress(pos, data, subcode, timeout, &mut |_, _| {})
+    }
+
+    /// Write bytes to storage and report `(bytes_done, bytes_total)` after each chunk.
+    pub fn write_lba_with_progress(
+        &mut self,
+        pos: u32,
+        data: &[u8],
+        subcode: u8,
+        timeout: Duration,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), RkUsbError> {
+        let total = data.len() as u64;
+        progress(0, total);
         if data.is_empty() {
             debug!("Skipping empty LBA write at start_sector={pos}");
             return Ok(());
         }
 
-        let deadline = Instant::now() + timeout;
+        self.ensure_lba_range(pos, sector_count_for_bytes(data.len())?)?;
+
         let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
         let (aligned, tail) = data.split_at(aligned_len);
         let mut next_pos = pos;
+        let mut done = 0u64;
 
         for chunk in aligned.chunks(MAX_LBA_TRANSFER_BYTES) {
-            self.write_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
+            self.write_lba_raw(next_pos, chunk, subcode, timeout)?;
             next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
+            done += chunk.len() as u64;
+            progress(done, total);
         }
 
         if !tail.is_empty() {
             let mut sector = [0u8; STORAGE_SECTOR_SIZE];
-            self.read_lba_raw(
-                next_pos,
-                &mut sector,
-                subcode,
-                Self::remaining_timeout(deadline)?,
-            )?;
+            self.read_lba_raw(next_pos, &mut sector, subcode, timeout)?;
             sector[..tail.len()].copy_from_slice(tail);
-            self.write_lba_raw(
-                next_pos,
-                &sector,
-                subcode,
-                Self::remaining_timeout(deadline)?,
-            )?;
+            self.write_lba_raw(next_pos, &sector, subcode, timeout)?;
+            progress(total, total);
         }
 
         Ok(())
@@ -662,12 +888,15 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     /// Transfers are batched automatically. If the output length is not a whole
     /// sector, the trailing bytes are satisfied from one extra 512-byte read.
     ///
+    /// The LBA range is checked against the current flash size before any read.
+    /// `timeout` is applied to each USB transfer chunk, not the whole operation.
+    ///
     /// # Arguments
     ///
     /// * `pos` - The index of the first sector to be read.
     /// * `data` - The output buffer for this operation.
     /// * `subcode` - `0` for "RWMETHOD_IMAGE" and `1` for "RWMETHOD_LBA". No idea what it means.
-    /// * `timeout` - The timeout limit for the entire operation.
+    /// * `timeout` - USB timeout for each transfer chunk.
     ///
     pub fn read_lba(
         &mut self,
@@ -676,30 +905,44 @@ impl<T: rusb::UsbContext> RkDevice<T> {
         subcode: u8,
         timeout: Duration,
     ) -> Result<(), RkUsbError> {
+        self.read_lba_with_progress(pos, data, subcode, timeout, &mut |_, _| {})
+    }
+
+    /// Read bytes from storage and report `(bytes_done, bytes_total)` after each chunk.
+    pub fn read_lba_with_progress(
+        &mut self,
+        pos: u32,
+        data: &mut [u8],
+        subcode: u8,
+        timeout: Duration,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), RkUsbError> {
+        let total = data.len() as u64;
+        progress(0, total);
         if data.is_empty() {
             debug!("Skipping empty LBA read at start_sector={pos}");
             return Ok(());
         }
 
-        let deadline = Instant::now() + timeout;
+        self.ensure_lba_range(pos, sector_count_for_bytes(data.len())?)?;
+
         let aligned_len = data.len() - (data.len() % STORAGE_SECTOR_SIZE);
         let (aligned, tail) = data.split_at_mut(aligned_len);
         let mut next_pos = pos;
+        let mut done = 0u64;
 
         for chunk in aligned.chunks_mut(MAX_LBA_TRANSFER_BYTES) {
-            self.read_lba_raw(next_pos, chunk, subcode, Self::remaining_timeout(deadline)?)?;
+            self.read_lba_raw(next_pos, chunk, subcode, timeout)?;
             next_pos = Self::advance_lba_by_bytes(next_pos, chunk.len())?;
+            done += chunk.len() as u64;
+            progress(done, total);
         }
 
         if !tail.is_empty() {
             let mut sector = [0u8; STORAGE_SECTOR_SIZE];
-            self.read_lba_raw(
-                next_pos,
-                &mut sector,
-                subcode,
-                Self::remaining_timeout(deadline)?,
-            )?;
+            self.read_lba_raw(next_pos, &mut sector, subcode, timeout)?;
             tail.copy_from_slice(&sector[..tail.len()]);
+            progress(total, total);
         }
 
         Ok(())
@@ -712,35 +955,371 @@ impl<T: rusb::UsbContext> RkDevice<T> {
     ///
     /// The range is split into device-sized commands automatically.
     ///
+    /// The LBA range is checked against the current flash size before any erase.
+    /// `timeout` is applied to each USB transfer chunk, not the whole operation.
+    ///
     /// # Arguments
     ///
     /// * `pos` - The index of the first LBA to be erased.
     /// * `count` - The number of LBAs to be erased.
-    /// * `timeout` - The timeout limit for the entire operation.
+    /// * `timeout` - USB timeout for each transfer chunk.
     ///
     pub fn erase_lba(&mut self, pos: u32, count: u32, timeout: Duration) -> Result<(), RkUsbError> {
+        self.erase_lba_with_progress(pos, count, timeout, &mut |_, _| {})
+    }
+
+    /// Erase sectors and report `(bytes_done, bytes_total)` after each chunk.
+    pub fn erase_lba_with_progress(
+        &mut self,
+        pos: u32,
+        count: u32,
+        timeout: Duration,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), RkUsbError> {
+        let total = count as u64 * STORAGE_SECTOR_SIZE as u64;
+        progress(0, total);
         if count == 0 {
             debug!("Skipping empty LBA erase at start_sector={pos}");
             return Ok(());
         }
 
-        let deadline = Instant::now() + timeout;
+        self.ensure_lba_range(pos, count)?;
+
         let mut next_pos = pos;
         let mut remaining = count;
+        let mut done = 0u64;
 
         while remaining != 0 {
             let chunk_sectors = remaining.min(u16::MAX as u32);
-            self.erase_lba_raw(
-                next_pos,
-                chunk_sectors as u16,
-                Self::remaining_timeout(deadline)?,
-            )?;
+            self.erase_lba_raw(next_pos, chunk_sectors as u16, timeout)?;
             next_pos = next_pos
                 .checked_add(chunk_sectors)
                 .ok_or(RkUsbError::LbaOverflow)?;
             remaining -= chunk_sectors;
+            done += chunk_sectors as u64 * STORAGE_SECTOR_SIZE as u64;
+            progress(done, total);
         }
 
         Ok(())
+    }
+
+    fn capability_bits(&mut self) -> Result<[u8; 8], RkUsbError> {
+        self.read_capability(USB_TIMEOUT)
+    }
+
+    fn loader_supports_vendor_storage(&mut self) -> Result<bool, RkUsbError> {
+        match self.capability_bits() {
+            Ok(cap) => Ok((cap[0] & ((1 << 1) | (1 << 4))) != 0),
+            Err(err) => {
+                debug!("capability probe failed, continuing SN attempt: {err}");
+                Ok(true)
+            }
+        }
+    }
+
+    fn loader_supports_otp(&mut self) -> Result<bool, RkUsbError> {
+        match self.capability_bits() {
+            Ok(cap) => Ok((cap[1] & (1 << 3)) != 0),
+            Err(err) => {
+                debug!("capability probe failed, continuing OTP attempt: {err}");
+                Ok(true)
+            }
+        }
+    }
+
+    fn vendor_storage_cbw(
+        opcode: u8,
+        index: u16,
+        backend: VendorBackend,
+        len: u16,
+    ) -> usb::Cbw<usb::Cbwcb> {
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(opcode);
+        cbw.data_transfer_length = len as u32;
+        // CDB address = index (BE16) || type (BE16), matching xrock vs_read/vs_write.
+        cbw.cb.address = ((index as u32) << 16 | backend as u32).to_be();
+        cbw.cb.length = len.to_be();
+        cbw
+    }
+
+    /// Read a vendor-storage item (RKDevInfoWriteTool / xrock `vs`, opcode 0x27).
+    pub fn read_vendor_storage(
+        &mut self,
+        index: u16,
+        backend: VendorBackend,
+        buf: &mut [u8],
+    ) -> Result<usize, RkUsbError> {
+        if buf.is_empty() || buf.len() > VENDOR_STORAGE_MAX {
+            return Err(RkUsbError::VendorPayloadTooLarge {
+                max: VENDOR_STORAGE_MAX,
+            });
+        }
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        let len = u16::try_from(buf.len()).map_err(|_| RkUsbError::VendorPayloadTooLarge {
+            max: VENDOR_STORAGE_MAX,
+        })?;
+        debug!(
+            "READ_VENDOR_STORAGE index={index} backend={} len={len}",
+            backend.name()
+        );
+        let cbw = Self::vendor_storage_cbw(0x27, index, backend, len);
+        self.cbw_transaction(&cbw, None, Some(buf), USB_TIMEOUT)
+    }
+
+    /// Write a vendor-storage item (RKDevInfoWriteTool / xrock `vs`, opcode 0x26).
+    pub fn write_vendor_storage(
+        &mut self,
+        index: u16,
+        backend: VendorBackend,
+        data: &[u8],
+    ) -> Result<(), RkUsbError> {
+        if data.is_empty() || data.len() > VENDOR_STORAGE_MAX {
+            return Err(RkUsbError::VendorPayloadTooLarge {
+                max: VENDOR_STORAGE_MAX,
+            });
+        }
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        let len = u16::try_from(data.len()).map_err(|_| RkUsbError::VendorPayloadTooLarge {
+            max: VENDOR_STORAGE_MAX,
+        })?;
+        debug!(
+            "WRITE_VENDOR_STORAGE index={index} backend={} len={len}",
+            backend.name()
+        );
+        let cbw = Self::vendor_storage_cbw(0x26, index, backend, len);
+        self.cbw_transaction(&cbw, Some(data), None, USB_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn read_sn_via_lba(&mut self) -> Result<Option<String>, RkUsbError> {
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        self.read_lba(VENDOR_SN_LBA, &mut buf, 0, USB_TIMEOUT)?;
+        decode_serial_number(&buf)
+    }
+
+    fn read_sn_via_vs(&mut self, backend: VendorBackend) -> Result<Option<String>, RkUsbError> {
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        let n = self.read_vendor_storage(VendorItemId::Sn as u16, backend, &mut buf)?;
+        let data = &buf[..n.min(buf.len())];
+        if let Ok(Some(sn)) = decode_serial_number(data) {
+            return Ok(Some(sn));
+        }
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let s = String::from_utf8_lossy(&data[..end]).into_owned();
+        if s.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(s))
+        }
+    }
+
+    /// Read SN the way RKDevInfoWriteTool / xrock do in loader mode.
+    ///
+    /// Tries the special LBA `0xFFF00001` first, then vendor-storage opcode 0x27
+    /// with `VENDOR_SN_ID` (1).
+    pub fn read_sn(&mut self) -> Result<Option<String>, RkUsbError> {
+        self.read_sn_with_backend(VendorBackend::Vendor)
+    }
+
+    pub fn read_sn_with_backend(
+        &mut self,
+        backend: VendorBackend,
+    ) -> Result<Option<String>, RkUsbError> {
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        match self.read_sn_via_lba() {
+            Ok(Some(sn)) => return Ok(Some(sn)),
+            Ok(None) => {}
+            Err(err) => debug!("SN LBA 0xFFF00001 read failed: {err}"),
+        }
+        self.read_sn_via_vs(backend)
+    }
+
+    /// Write SN via the special LBA *and* vendor-storage opcode, matching
+    /// RKDevInfoWriteTool's loader write (SN + vendor item 1).
+    pub fn write_sn(&mut self, sn: &str) -> Result<(), RkUsbError> {
+        self.write_sn_with_backend(sn, VendorBackend::Vendor)
+    }
+
+    pub fn write_sn_with_backend(
+        &mut self,
+        sn: &str,
+        backend: VendorBackend,
+    ) -> Result<(), RkUsbError> {
+        if !self.loader_supports_vendor_storage()? {
+            return Err(RkUsbError::VendorStorageUnsupported);
+        }
+        let sector = encode_serial_number(sn)?;
+        self.write_lba(VENDOR_SN_LBA, &sector, 0, USB_TIMEOUT)?;
+        // Raw SN bytes on item 1 — same ID the kernel `vendor_storage` tool uses.
+        if !sn.is_empty() {
+            if let Err(err) =
+                self.write_vendor_storage(VendorItemId::Sn as u16, backend, sn.as_bytes())
+            {
+                debug!("vendor-storage opcode SN write failed (LBA write succeeded): {err}");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_mac(
+        &mut self,
+        item: VendorItemId,
+        backend: VendorBackend,
+    ) -> Result<Option<[u8; 6]>, RkUsbError> {
+        if !item.is_mac() {
+            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
+        }
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        let n = self.read_vendor_storage(item as u16, backend, &mut buf)?;
+        if n < 6 || buf[..6].iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[..6]);
+        Ok(Some(mac))
+    }
+
+    pub fn write_mac(
+        &mut self,
+        item: VendorItemId,
+        backend: VendorBackend,
+        mac: [u8; 6],
+    ) -> Result<(), RkUsbError> {
+        if !item.is_mac() {
+            return Err(RkUsbError::Usb(rusb::Error::InvalidParam));
+        }
+        self.write_vendor_storage(item as u16, backend, &mac)
+    }
+
+    /// Read SoC chip info (opcode 0x1B). First four bytes are a LE ASCII tag
+    /// such as `3588` / `3568`.
+    pub fn read_chip_info(&mut self) -> Result<[u8; 16], RkUsbError> {
+        debug!("Reading chip info");
+        let mut buf = [0u8; 16];
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x1B); // READ_CHIP_INFO
+        cbw.data_transfer_length = buf.len() as u32;
+        self.cbw_transaction(&cbw, None, Some(&mut buf), USB_TIMEOUT)?;
+        Ok(buf)
+    }
+
+    /// Dump chip OTP / eFuse bytes (xrock `otp`, opcode 0x2C).
+    pub fn read_otp(&mut self, buf: &mut [u8]) -> Result<(), RkUsbError> {
+        if buf.is_empty() {
+            return Err(RkUsbError::InvalidOtpLength);
+        }
+        if !self.loader_supports_otp()? {
+            return Err(RkUsbError::OtpUnsupported);
+        }
+        debug!("Reading OTP bytes={}", buf.len());
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x2C); // READ_OTP_CHIP
+        cbw.data_transfer_length = buf.len() as u32;
+        self.cbw_transaction(&cbw, None, Some(buf), USB_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// Pull the miniloader UART ring buffer over USB (opcode 0x28 READ_COM_LOG).
+    ///
+    /// This is the same text that would appear on the debug serial console,
+    /// including `SecureMode = 0/1`.
+    pub fn read_com_log(&mut self, buf: &mut [u8]) -> Result<usize, RkUsbError> {
+        if buf.is_empty() {
+            return Err(RkUsbError::InvalidOtpLength);
+        }
+        match self.capability_bits() {
+            Ok(cap) if cap[0] & (1 << 5) == 0 => {
+                debug!("capability does not advertise Read Com Log; trying anyway");
+            }
+            Err(err) => debug!("capability probe failed, trying COM LOG anyway: {err}"),
+            _ => {}
+        }
+        debug!("Reading COM log bytes={}", buf.len());
+        let mut cbw = usb::Cbw::<usb::Cbwcb>::with_opcode(0x28); // READ_COM_LOG
+        cbw.data_transfer_length = buf.len() as u32;
+        self.cbw_transaction_ex(&cbw, None, Some(buf), USB_TIMEOUT, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serial_number_roundtrip() {
+        let encoded = encode_serial_number("RK3588-TEST-001").unwrap();
+        assert_eq!(&encoded[0..4], &1u32.to_le_bytes());
+        assert_eq!(&encoded[4..8], &15u32.to_le_bytes());
+        assert_eq!(
+            decode_serial_number(&encoded).unwrap().as_deref(),
+            Some("RK3588-TEST-001")
+        );
+    }
+
+    #[test]
+    fn serial_number_invalid_flag() {
+        let mut buf = [0u8; STORAGE_SECTOR_SIZE];
+        assert_eq!(decode_serial_number(&buf).unwrap(), None);
+        buf[0] = 1;
+        buf[4] = 3;
+        buf[8..11].copy_from_slice(b"abc");
+        assert_eq!(decode_serial_number(&buf).unwrap().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn serial_number_too_long() {
+        let sn = "a".repeat(SN_MAX_LEN + 1);
+        assert!(matches!(
+            encode_serial_number(&sn),
+            Err(RkUsbError::SnTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn lba_range_rejects_overflow() {
+        let err = check_lba_range(100, 50, 120).unwrap_err();
+        assert!(matches!(
+            err,
+            RkUsbError::LbaOutOfRange {
+                start: 100,
+                count: 50,
+                flash_sectors: 120
+            }
+        ));
+        check_lba_range(100, 20, 120).unwrap();
+        check_lba_range(VENDOR_SN_LBA, 1, 120).unwrap();
+        check_lba_range(0, 10, 0).unwrap();
+    }
+
+    #[test]
+    fn storage_slug_known_and_unknown() {
+        assert_eq!(storage_slug(1), "eMMC");
+        assert_eq!(storage_name(9), "SPI NOR");
+        assert_eq!(storage_slug(9), "SPINOR");
+        assert_eq!(storage_slug(99), "storage99");
+    }
+
+    #[test]
+    fn mac_parse_and_format() {
+        assert_eq!(
+            parse_mac("88:A9:A7:00:BC:64").unwrap(),
+            [0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]
+        );
+        assert_eq!(
+            parse_mac("88a9a700bc64").unwrap(),
+            [0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]
+        );
+        assert_eq!(format_mac(&[0x88, 0xA9, 0xA7, 0x00, 0xBC, 0x64]), "88:A9:A7:00:BC:64");
+        assert!(parse_mac("not-a-mac").is_err());
+    }
+
+    #[test]
+    fn vendor_item_slug_roundtrip() {
+        assert_eq!(VendorItemId::parse_slug("sn"), Some(VendorItemId::Sn));
+        assert_eq!(VendorItemId::parse_slug("wifi-mac"), Some(VendorItemId::WifiMac));
+        assert_eq!(VendorBackend::parse("rpmb"), Some(VendorBackend::Rpmb));
     }
 }

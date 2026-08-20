@@ -13,10 +13,13 @@ It supports common Maskrom and Loader workflows such as downloading a loader, re
 - List devices
 - Download a bootloader in Maskrom mode
 - Reset devices
-- Read, write, and erase raw LBAs
+- Read, write, and erase raw LBAs with live USB speed and a progress bar
+- LBA range checks against the current flash size (no more whole-command timeout)
 - Wait for device enumeration
 - Query and switch storage media
-- Read GPT partitions and transfer partition contents
+- Read GPT partitions, dump all partitions, and auto-save a partition table file
+- Read and write the device serial number (xrock `sn`)
+- Dump chip OTP / eFuse (xrock `otp`)
 - Parse Rockchip image files
 - Generate and write IDBlock data from a loader image
 
@@ -81,10 +84,12 @@ rktools rst --subcode 1  # power off
 | `download-boot` | `db` | Download a loader image to a device in Maskrom mode |
 | `info` | - | Detect and inspect Rockchip image files |
 | `reset` | `rst` | Reset or power off a connected device |
-| `lba` | - | Read, write, or erase raw sectors by LBA |
+| `lba` | - | Read, write, or erase raw sectors by LBA (progress + range check) |
 | `wait` | - | Wait for a Rockchip device to appear |
 | `storage` | `st` | Query storage, switch media, print flash info, and access GPT partitions |
 | `upgrade-loader` | `ul` | Generate and write an IDBlock from a Rockchip loader image |
+| `sn` | `serial` | Read or write the device serial number |
+| `otp` | - | Dump chip OTP / eFuse |
 
 ### List connected devices
 
@@ -135,7 +140,8 @@ Notes:
 
 - `begin_sector` and `sector_count` accept decimal and `0x`-prefixed hexadecimal values.
 - `lba write` automatically pads the last partial sector with zeros.
-- `--timeout` applies to the full command, not each individual USB transfer.
+- Before each read/write/erase the tool checks the requested LBA range against the flash size from `storage info`. Transfers that would run past the end of the medium are rejected.
+- `--timeout` is the USB timeout **per transfer chunk**. The whole operation is bounded by the requested range size, not a fixed wall-clock budget. A live progress bar shows percentage, transferred size, and USB speed.
 
 ### Storage operations
 
@@ -176,9 +182,11 @@ This prints the parsed flash/storage information structure returned by the devic
 
 ```sh
 rktools storage partition table
+rktools storage partition table --no-save
+rktools storage partition table -o custom_table.txt
 ```
 
-The command opens the currently selected storage as a 512-byte logical block device, reads the GPT, and prints the discovered partitions.
+The command opens the currently selected storage as a 512-byte logical block device, reads the GPT, and prints the discovered partitions. It also writes a partition table file named from the current storage type and size reported by `st i`, for example `eMMC_29.12GiB_partition_table.txt`.
 
 #### Read a GPT partition to a file
 
@@ -208,6 +216,59 @@ Partition write behavior:
 - The target partition can be selected by exactly one of `--name`, `--guid`, or `--index`.
 - The input file must fit inside the selected partition.
 - The final partial sector is zero-padded automatically when needed.
+- Read and write show a live progress bar (percentage, size, USB speed). `--timeout` is per USB chunk.
+
+#### Dump all GPT partitions
+
+```sh
+# dump every GPT partition into eMMC_29.12GiB/ (name comes from st i)
+rktools storage partition dump
+
+# dump into a custom directory and skip huge/volatile partitions
+rktools storage partition dump ./backup --exclude userdata,cache
+```
+
+This is the batch-read flow similar to spreadtrum_flash `r all` / `read_parts`:
+
+- Creates an output directory named `<storage>_<size>` unless you pass one
+- Writes `<storage>_<size>_partition_table.txt` first
+- Reads each GPT partition to `<name>.img` with a per-partition progress bar
+
+### Serial number and vendor storage (RKDevInfoWriteTool)
+
+In loader mode RKDevInfoWriteTool writes SN / WiFi MAC / LAN MAC / BT MAC into vendor storage. The loader exposes that through:
+
+1. Special LBA `0xFFF00001` for SN (`valid:u32le`, `len:u32le`, payload) — same as xrock `sn`
+2. Opcodes `0x26` (WRITE) / `0x27` (READ) with item id + backend type — same as xrock `vs`
+
+Item IDs match the kernel (`rk_vendor_storage.h`): `1=SN`, `2=WIFI MAC`, `3=LAN MAC`, `4=BT MAC`, `15=IMEI`. `--backend rpmb` selects eMMC RPMB (RKDevInfoWriteTool default on RK3588); `--backend vendor` uses the `vnvm` partition.
+
+```sh
+# SN (tries LBA 0xFFF00001, then vendor item 1)
+rktools sn
+rktools sn write RK3588-TEST-001
+rktools sn --backend rpmb write RK3588-TEST-001
+
+# dump SN + MACs
+rktools vendor dump
+rktools vendor dump --backend rpmb
+
+# individual items
+rktools vendor read sn
+rktools vendor write wifi-mac 88:A9:A7:00:BC:64
+rktools vendor write lan-mac 88A9A700BC95
+rktools vendor write bt-mac 88:A9:A7:00:BC:66
+rktools vendor read imei
+```
+
+OTP dump uses opcode `0x2C` and is decoded against the Linux/U-Boot NS OTP map for the SoC (CPUID, cpu-code, leakage bins). Secure Boot key hash lives in *secure* OTP and is usually **not** in this dump.
+
+```sh
+rktools otp                  # 128-byte dump + named fields (auto map from chip info)
+rktools otp 256
+rktools otp --map rk3588
+rktools otp --raw            # hex only
+```
 
 ### Upgrade loader by writing an IDBlock
 

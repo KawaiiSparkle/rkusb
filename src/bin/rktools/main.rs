@@ -1,6 +1,7 @@
 use clap::{ArgAction, Parser, Subcommand};
 
 mod common;
+mod progress;
 mod storage;
 mod subcommands;
 mod util;
@@ -42,6 +43,15 @@ enum Commands {
         visible_alias("ul")
     )]
     UpgradeLoader(subcommands::upgrade_loader::Args),
+    #[command(about = "Read or write device serial number", visible_alias("serial"))]
+    Sn(subcommands::sn::Args),
+    #[command(
+        about = "Read/write vendor storage (SN, MAC, IMEI) like RKDevInfoWriteTool",
+        visible_alias("vs")
+    )]
+    Vendor(subcommands::vendor::Args),
+    #[command(about = "Dump chip OTP / eFuse (xrock otp)")]
+    Otp(subcommands::otp::Args),
 }
 
 fn main() {
@@ -66,6 +76,9 @@ fn handle_command(cmd: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         Commands::UpgradeLoader(args) => {
             subcommands::upgrade_loader::exec(rusb::Context::new()?, args)?
         }
+        Commands::Sn(args) => subcommands::sn::exec(rusb::Context::new()?, args)?,
+        Commands::Vendor(args) => subcommands::vendor::exec(rusb::Context::new()?, args)?,
+        Commands::Otp(args) => subcommands::otp::exec(rusb::Context::new()?, args)?,
     }
     Ok(())
 }
